@@ -20,10 +20,10 @@ import tsuki.util.parseHtml
 import tsuki.util.toAbsoluteUrl
 import tsuki.util.urlEncoded
 
+import org.json.JSONArray
 import org.jsoup.nodes.Element
 import java.util.EnumSet
 import java.util.Locale
-
 
 @MangaSourceParser("HENTAIENVY", "HentaiEnvy", type = ContentType.HENTAI)
 internal class HentaiEnvy(context: MangaLoaderContext) :
@@ -40,7 +40,7 @@ internal class HentaiEnvy(context: MangaLoaderContext) :
     override val selectGalleryLink = "a.hnv-gallery-card__cover"
     override val selectGalleryImg = "a.hnv-gallery-card__cover img"
     override val selectGalleryTitle = ".hnv-gallery-card__title"
-    
+
     override val selectTags = "ul.hnv-legacy-taxonomy__items"
 
     override fun Element.parseTags(): Set<MangaTag> = select("a").mapNotNull { a ->
@@ -192,38 +192,29 @@ internal class HentaiEnvy(context: MangaLoaderContext) :
         return parseMangaList(webClient.httpGet(url).parseHtml())
     }
 
-    /** 50/50 if endpoint of images after the number has a "t" */
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+        val galleryId = chapter.url.trimEnd('/')
+            .substringAfterLast('/')
+            .toIntOrNull() ?: return emptyList()
 
-        val grid = doc.selectFirst("#js-thumbs-grid")
+        val readerDoc = webClient.httpGet("https://$domain/g/$galleryId/1/").parseHtml()
+        val reader = readerDoc.selectFirst("section#readerApp") ?: return emptyList()
 
-        val totalPages = grid?.attr("data-total-pages")?.trim()?.toIntOrNull()
-            ?: doc.selectFirst("[data-total-pages]")?.attr("data-total-pages")?.trim()?.toIntOrNull()
-            ?: doc.selectFirst(".hnv-gallery-entity-group:has(:contains(Pages:)) .hnv-gallery-entity-items")
-                ?.text()?.trim()?.toIntOrNull()
-            ?: return emptyList()
+        val base = reader.attr("data-reader-image-base").trim().trimEnd('/')
+        if (base.isEmpty()) return emptyList()
 
-        if (totalPages <= 0) return emptyList()
-        
-        val firstThumb = grid?.selectFirst("img")?.attr("src")?.trim()?.takeIf { it.isNotBlank() }
-            ?: doc.selectFirst(".hnv-gallery-cover img")?.attr("src")?.trim()?.takeIf { it.isNotBlank() }
-            ?: return emptyList()
+        val json = readerDoc.selectFirst("script#readerPagesJson")?.data() ?: return emptyList()
+        val arr = JSONArray(json)
 
-        val base = firstThumb.substringBeforeLast('/') + "/"
+        return (0 until arr.length()).mapNotNull { i ->
+            val obj = arr.optJSONObject(i) ?: return@mapNotNull null
+            val page = obj.optInt("page", 0)
+            val ext = obj.optString("ext", "").trim().removePrefix(".")
+            if (page <= 0 || ext.isBlank()) return@mapNotNull null
 
-        val ext = firstThumb.substringAfterLast('.').substringBefore('?').trim()
-            .takeIf { it.isNotBlank() } ?: "jpg"
-
-
-        val firstThumbName = firstThumb.substringAfterLast('/')
-        val suffix = if (firstThumbName.matches(Regex("""\d+t\.[a-zA-Z0-9]+"""))) "t" else ""
-
-        return (1..totalPages).map { idx ->
-            val imageUrl = "${base}${idx}${suffix}.${ext}"
             MangaPage(
-                id = generateUid("$chapter.url#$idx"),
-                url = imageUrl,
+                id = generateUid("$chapter.url#$page"),
+                url = "$base/$page.$ext",
                 preview = null,
                 source = source,
             )

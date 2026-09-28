@@ -51,7 +51,6 @@ import androidx.collection.ScatterMap
 import androidx.collection.intObjectMapOf
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
@@ -71,17 +70,19 @@ internal abstract class LibSocialParser(
 
     protected open val apiHost = "api.cdnlibs.org"
 
+    @Volatile
+    private var accessToken: String? = null
+
     override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
     override val authUrl: String
         get() = "https://$domain/ru/front/auth"
 
     override suspend fun isAuthorized(): Boolean {
-        val token = getAuthData()?.optJSONObject("token")?.getStringOrNull("access_token")
-        return !token.isNullOrEmpty()
+        return !refreshAuthData()?.optJSONObject("token")?.getStringOrNull("access_token").isNullOrEmpty()
     }
 
-    override suspend fun getUsername(): String = getAuthData()
+    override suspend fun getUsername(): String = refreshAuthData()
         ?.getJSONObject("auth")
         ?.getString("username")
         ?: throw AuthRequiredException(source)
@@ -117,7 +118,7 @@ internal abstract class LibSocialParser(
     )
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val token = runBlocking { getAuthData() }?.optJSONObject("token")?.getStringOrNull("access_token")
+        val token = accessToken
         val requestBuilder = chain.request().newBuilder()
         if (!token.isNullOrEmpty()) {
             requestBuilder.header("Authorization", "Bearer $token")
@@ -458,6 +459,10 @@ internal abstract class LibSocialParser(
         genres.forEach { x -> if (names.add(x.title)) result.add(x) }
         tags.forEach { x -> if (names.add(x.title)) result.add(x) }
         return result
+    }
+
+    private suspend fun refreshAuthData(): JSONObject? = getAuthData().also { authData ->
+        accessToken = authData?.optJSONObject("token")?.getStringOrNull("access_token")
     }
 
     private suspend fun getAuthData(): JSONObject? {

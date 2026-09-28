@@ -167,6 +167,12 @@ internal abstract class MangaBallParser(
         val title = doc.selectFirst("#comicDetail h6")?.ownTextOrNull()?.trim()?.nullIfEmpty() ?: manga.title
         val cover = doc.selectFirst("img.featured-cover")?.absUrl("src")?.nullIfEmpty() ?: manga.coverUrl
         val description = doc.selectFirst("#descriptionContent p")?.wholeText()?.trim()?.nullIfEmpty()
+        val rating = doc.selectFirst("button[title='Click to view rating details & rate title'] > span")
+            ?.text()
+            ?.toFloatOrNull()
+            ?.takeIf { it in 0f..10f }
+            ?.div(10f)
+            ?: RATING_UNKNOWN
         val contentRating = when {
             tags.any { it.title in ADULT_TAG_TITLES } -> ContentRating.ADULT
             else -> manga.contentRating
@@ -182,6 +188,7 @@ internal abstract class MangaBallParser(
             state = status,
             authors = authors,
             description = description,
+            rating = rating,
             chapters = getChapterList(manga.url),
             contentRating = contentRating,
         )

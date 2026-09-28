@@ -78,7 +78,7 @@ abstract class MmrcmsParser(
         paginator.firstPage = 1
         searchPaginator.firstPage = 1
     }
-    
+
     protected open val itemPath = "manga"
     protected open val dateFormat = SimpleDateFormat("d MMM. yyyy", Locale.US)
     protected open val fetchFilterOptions = true
@@ -100,7 +100,7 @@ abstract class MmrcmsParser(
     protected open val selectDate = "div.date-chapter-title-rtl"
     protected open val selectChapter = "ul.chapters > li:not(.btn)"
     protected open val selectPage = "div#all img"
-    
+
     @Volatile
     private var tagsCache: Set<MangaTag>? = null
     private val tagsMutex = Mutex()
@@ -131,7 +131,7 @@ abstract class MmrcmsParser(
             MangaTag(key = href, title = a.text(), source = source)
         }
     }
-    
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         if (order == SortOrder.UPDATED && (filter.query != null || filter.tags.isNotEmpty())) {
             throw IllegalArgumentException(
@@ -208,7 +208,7 @@ abstract class MmrcmsParser(
                 contentRating = if (isNsfwSource) ContentRating.ADULT else null,
             )
         }
-    
+
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
         val fullUrl = manga.url.toAbsoluteUrl(domain)
         val doc = webClient.httpGet(fullUrl).parseHtml()
@@ -265,7 +265,7 @@ abstract class MmrcmsParser(
                 )
             }
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
         return doc.select(selectPage).mapNotNull { img ->
@@ -273,7 +273,7 @@ abstract class MmrcmsParser(
             MangaPage(id = generateUid(url), url = url, preview = null, source = source)
         }
     }
-    
+
     protected fun String?.toMangaState(): MangaState? = when (this?.lowercase(Locale.US)) {
         "complete", "completed" -> MangaState.FINISHED
         "ongoing", "on going" -> MangaState.ONGOING

@@ -196,8 +196,8 @@ internal abstract class MangaBallParser(
 
         val rating = data.optJSONObject("ratings")
             ?.optDouble("rating_average", -1.0)
-            ?.takeIf { it >= 0.0 }
-            ?.let { (it / 2.0).toFloat() }
+            ?.takeIf { it in 0.0..10.0 }
+            ?.let { (it / 10.0).toFloat() }
             ?: RATING_UNKNOWN
 
         val coverUrl  = parseCoverUrl(data.optJSONObject("image"))

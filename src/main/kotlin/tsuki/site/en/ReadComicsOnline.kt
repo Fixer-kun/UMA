@@ -10,19 +10,18 @@ import tsuki.model.Manga
 import tsuki.model.MangaChapter
 import tsuki.model.MangaListFilter
 import tsuki.model.MangaListFilterCapabilities
+import tsuki.model.MangaListFilterOptions
 import tsuki.model.MangaPage
 import tsuki.model.MangaParserSource
 import tsuki.model.MangaState
 import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
-import tsuki.model.MangaListFilterOptions
 
 import tsuki.util.generateUid
-import tsuki.util.parseJson
-import tsuki.util.urlEncoded
 import tsuki.util.attrAsRelativeUrl
 import tsuki.util.mapChapters
+import tsuki.util.mapNotNullToSet
 import tsuki.util.nullIfEmpty
 import tsuki.util.parseHtml
 import tsuki.util.parseSafe
@@ -31,17 +30,14 @@ import tsuki.util.src
 import tsuki.util.textOrNull
 import tsuki.util.toAbsoluteUrl
 import tsuki.util.toRelativeUrl
+import tsuki.util.urlEncoded
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
-import tsuki.util.mapNotNullToSet
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
-
-// TODO: getListpage use advanced-search
 
 @MangaSourceParser("READCOMICSONLINE", "ReadComicsOnline.ru", "en", ContentType.COMICS)
 internal class ReadComicsOnline(context: MangaLoaderContext) :
@@ -57,76 +53,137 @@ internal class ReadComicsOnline(context: MangaLoaderContext) :
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
             isSearchSupported = true,
-            isSearchWithFiltersSupported = false,
+            isSearchWithFiltersSupported = true,
+            isMultipleTagsSupported = false,
         )
 
-    override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions()
+    override suspend fun getFilterOptions(): MangaListFilterOptions {
+        val doc = webClient.httpGet("https://$domain/advanced-search").parseHtml()
 
-    override val fetchFilterOptions = false
+        val categories = doc.select("select[name=category] option")
+            .mapNotNullToSet { option ->
+                val id = option.attr("value").trim()
+                val name = option.text().trim()
+                if (id.isEmpty() || name.isEmpty()) null
+                else MangaTag(key = id, title = name, source = source)
+            }
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        if (!filter.query.isNullOrEmpty()) {
-            return search(page, filter.query!!)
-        }
-        if (filter.tags.isNotEmpty() || filter.states.isNotEmpty()) {
-            return emptyList()
-        }
-
-        val sort = when (order) {
-            SortOrder.UPDATED -> "latest"
-            else -> "views"
-        }
-        val doc = webClient.httpGet("https://$domain/comic-list?sort=$sort&page=$page").parseHtml()
-        return doc.select("div.comic-list-layout .grid > .group").mapNotNull(::parseMangaListItem)
+        return MangaListFilterOptions(
+            availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
+            availableTags = categories,
+            availableContentTypes = EnumSet.of(
+                ContentType.MANGA, // DC Comics
+                ContentType.MANHWA, // Marvel Comics
+                ContentType.MANHUA, // Other Comics
+            ),
+        )
     }
 
-    private suspend fun search(page: Int, query: String): List<Manga> {
-        if (page > 1) return emptyList()
+    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val hasFilters = !filter.query.isNullOrEmpty()
+                || filter.states.isNotEmpty()
+                || filter.types.isNotEmpty()
+                || filter.tags.isNotEmpty()
 
-        val url = "https://$domain/search?query=${query.trim().urlEncoded()}"
-        val suggestions = webClient.httpGet(url).parseJson()
-            .optJSONArray("suggestions") ?: return emptyList()
+        val url = if (hasFilters) {
+            buildAdvancedSearchUrl(page, filter)
+        } else {
+            val sort = when (order) {
+                SortOrder.UPDATED -> "latest"
+                else -> "views"
+            }
+            "https://$domain/comic-list?sort=$sort&page=$page"
+        }
 
-        return (0 until suggestions.length()).mapNotNull { i ->
-            val jo = suggestions.optJSONObject(i) ?: return@mapNotNull null
-            val slug = jo.optString("data").nullIfEmpty() ?: return@mapNotNull null
-            val href = "/comic/$slug"
+        val doc = webClient.httpGet(url).parseHtml()
+        return parseComicListCards(doc).ifEmpty { parseSearchResultCards(doc) }
+    }
+
+    private fun buildAdvancedSearchUrl(page: Int, filter: MangaListFilter): String {
+        val params = buildList {
+            filter.query?.takeIf { it.isNotBlank() }?.let {
+                add("name=${it.urlEncoded()}")
+            }
+
+            filter.states.firstOrNull()?.let { state ->
+                val id = when (state) {
+                    MangaState.ONGOING -> "1"
+                    MangaState.FINISHED -> "2"
+                    else -> null
+                }
+                if (id != null) add("status_id=$id")
+            }
+
+            filter.types.firstOrNull()?.let { type ->
+                val id = when (type) {
+                    ContentType.MANGA -> "1"
+                    ContentType.MANHWA -> "2"
+                    ContentType.MANHUA -> "3"
+                    else -> null
+                }
+                if (id != null) add("type_id=$id")
+            }
+
+            filter.tags.firstOrNull()?.let { tag ->
+                add("category=${tag.key}")
+            }
+
+            add("page=$page")
+        }
+        return "https://$domain/advanced-search?" + params.joinToString("&")
+    }
+
+    private fun parseComicListCards(doc: Document): List<Manga> =
+        doc.select("div.comic-list-layout .grid > .group").mapNotNull { element ->
+            val anchor = element.selectFirst("a.block.text-sm.font-semibold")
+                ?: return@mapNotNull null
+            val href = anchor.attrAsRelativeUrl("href")
             Manga(
                 id = generateUid(href),
-                title = jo.optString("value").nullIfEmpty() ?: slug,
+                title = anchor.text(),
                 altTitles = emptySet(),
                 url = href,
-                publicUrl = jo.optString("url").nullIfEmpty()
-                    ?: href.toAbsoluteUrl(domain),
+                publicUrl = href.toAbsoluteUrl(domain),
                 rating = RATING_UNKNOWN,
                 contentRating = if (isNsfwSource) ContentRating.ADULT else null,
-                coverUrl = guessCover(href, jo.optString("cover").nullIfEmpty()),
+                coverUrl = guessCover(href, element.selectFirst("img")?.src()),
                 tags = emptySet(),
                 state = null,
                 authors = emptySet(),
                 source = source,
             )
         }
-    }
 
-    private fun parseMangaListItem(element: Element): Manga? {
-        val anchor = element.selectFirst("a.block.text-sm.font-semibold") ?: return null
-        val href = anchor.attrAsRelativeUrl("href")
-        return Manga(
-            id = generateUid(href),
-            title = anchor.text(),
-            altTitles = emptySet(),
-            url = href,
-            publicUrl = href.toAbsoluteUrl(domain),
-            rating = RATING_UNKNOWN,
-            contentRating = if (isNsfwSource) ContentRating.ADULT else null,
-            coverUrl = guessCover(href, element.selectFirst("img")?.src()),
-            tags = emptySet(),
-            state = null,
-            authors = emptySet(),
-            source = source,
-        )
-    }
+    private fun parseSearchResultCards(doc: Document): List<Manga> =
+        doc.select("a.group[href*=/comic/]").mapNotNull { anchor ->
+            val href = anchor.attrAsRelativeUrl("href")
+            if (href.isBlank()) return@mapNotNull null
+
+            val title = anchor.selectFirst("p")?.text()?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: anchor.selectFirst("img")?.attr("alt")?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+
+            val cover = anchor.selectFirst(".rc-cover img, img")
+                ?.let { it.attr("src").ifBlank { it.attr("data-src") } }
+                ?.trim()?.takeIf { it.isNotBlank() }
+
+            Manga(
+                id = generateUid(href),
+                title = title,
+                altTitles = emptySet(),
+                url = href,
+                publicUrl = href.toAbsoluteUrl(domain),
+                rating = RATING_UNKNOWN,
+                contentRating = if (isNsfwSource) ContentRating.ADULT else null,
+                coverUrl = cover ?: guessCover(href, null),
+                tags = emptySet(),
+                state = null,
+                authors = emptySet(),
+                source = source,
+            )
+        }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
         val fullUrl = manga.url.toAbsoluteUrl(domain)

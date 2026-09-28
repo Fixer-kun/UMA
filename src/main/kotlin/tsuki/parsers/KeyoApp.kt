@@ -25,12 +25,11 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.time.LocalDate
-import java.time.ZoneOffset
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.EnumSet
 import java.util.Locale
+import java.util.TimeZone
 
 abstract class KeyoApp(
     context: MangaLoaderContext,
@@ -44,7 +43,7 @@ abstract class KeyoApp(
     override val webClient = OkHttpWebClient(context.httpClient, source)
 
     protected val baseUrl get() = "https://$domain"
-    protected open val dateFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.ENGLISH)
+    protected open val dateFormat: String = "MMM d, yyyy"
 
     protected open val showPaidChapters: Boolean = false
 
@@ -258,7 +257,6 @@ abstract class KeyoApp(
 
     protected open val descriptionSelector: String = "#expand_content p"
     protected open val altNameSelector: String = "div.font-medium:containsOwn(Alternative titles) ~ div span"
-    protected open val altNamePrefix: String = "Alternative names:"
     protected open val statusSelector: String = "div:has(span:containsOwn(Status)) ~ div"
     protected open val authorSelector: String = "div:has(span:containsOwn(Author)) ~ div"
     protected open val artistSelector: String = "div:has(span:containsOwn(Artist)) ~ div"
@@ -415,10 +413,9 @@ abstract class KeyoApp(
         if (text.isEmpty()) return 0L
         if (text.contains("ago", ignoreCase = true)) return parseRelativeDate()
         return try {
-            LocalDate.parse(text, dateFormat)
-                .atStartOfDay(ZoneOffset.UTC)
-                .toInstant()
-                .toEpochMilli()
+            SimpleDateFormat(dateFormat, Locale.ENGLISH).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.parse(text)?.time ?: 0L
         } catch (_: Exception) {
             0L
         }

@@ -161,6 +161,11 @@ internal abstract class MangaKParser(
                 }
             }
 
+            filter.author?.trim()?.takeIf { it.isNotEmpty() }?.let { author ->
+                append("&author=")
+                append(author.urlEncoded())
+            }
+
             if (filter.tags.isNotEmpty()) {
                 append("&genres=")
                 append(filter.tags.joinToString(",") { it.key })

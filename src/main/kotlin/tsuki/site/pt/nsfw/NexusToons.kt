@@ -262,7 +262,7 @@ internal class NexusToons(context: MangaLoaderContext) :
             )
         }
     }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.substringAfter("/manga/").trimEnd('/')
         val json = fetchApi("https://$domain/api/manga/$slug")
@@ -292,7 +292,7 @@ internal class NexusToons(context: MangaLoaderContext) :
                     source = source,
                 )
             }
-        }.orEmpty()
+        }.orEmpty().sortedBy { it.number }
 
         val categories = json.optJSONArray("categories")?.let { arr ->
             (0 until arr.length())
@@ -389,7 +389,7 @@ internal class NexusToons(context: MangaLoaderContext) :
             repeat(length) { append(chars.random()) }
         }
     }
-    
+
     private fun MangaState.toApiStatus(): String = when (this) {
         MangaState.ONGOING -> "ongoing"
         MangaState.FINISHED -> "completed"
@@ -430,7 +430,7 @@ internal class NexusToons(context: MangaLoaderContext) :
         private val ISO_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
-        
+
         private val NEXUS_GENRES: List<Pair<String, String>> = listOf(
             "Academia de Magia" to "academia-de-magia",
             "Acadêmica" to "academica",

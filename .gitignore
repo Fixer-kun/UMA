@@ -76,7 +76,6 @@ fabric.properties
 build/
 bin/
 
-
 .idea/**/misc.xml
 .idea/**/vcs.xml
 .idea/**/ktlint.xml

@@ -36,8 +36,6 @@ internal class MangaDistrict(context: MangaLoaderContext) :
         )
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // Search / no-tag path: the site returns 404 for pages past the last one,
-        // which makes the base parser throw. Treat that as "no more results".
         if (filter.tags.isEmpty()) {
             return try {
                 super.getListPage(page, order, filter)
@@ -76,7 +74,6 @@ internal class MangaDistrict(context: MangaLoaderContext) :
         val html = try {
             webClient.httpGet(url).parseHtml()
         } catch (e: HttpStatusException) {
-            // 404 on a genre page past the last one = end of results
             if (e.statusCode == 404) return emptyList()
             throw ParseException("Failed to load page: ${e.statusCode}", url)
         }

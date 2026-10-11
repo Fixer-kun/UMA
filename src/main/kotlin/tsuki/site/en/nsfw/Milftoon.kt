@@ -7,6 +7,8 @@ import tsuki.parsers.MadaraParser
 import tsuki.model.ContentType
 import tsuki.model.MangaParserSource
 
+import tsuki.Broken
+@Broken
 @MangaSourceParser("MILFTOON", "MilfToon", "en", ContentType.HENTAI)
 internal class MilfToon(context: MangaLoaderContext) :
     MadaraParser(context, MangaParserSource.MILFTOON, "milftoon.xxx", 20) {

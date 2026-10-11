@@ -178,6 +178,10 @@ internal class Atsumaru(context: MangaLoaderContext) :
     private suspend fun fetchTopRated(page: Int) = fetchList("topRated", page)
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        if (!filter.query.isNullOrBlank()) {
+            return getSearchPage(page, SortOrder.UPDATED, filter)
+        }
+
         return when (order) {
             SortOrder.RELEVANCE -> fetchRising(page)
             SortOrder.RATING -> fetchTopRated(page)

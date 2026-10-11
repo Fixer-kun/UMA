@@ -34,7 +34,9 @@ import java.util.Locale
 import java.util.TimeZone
 
 // TODO: status filter does not work
+import tsuki.Broken
 
+@Broken("meh")
 @MangaSourceParser("TEMPLESCAN", "Temple Scan", "en", ContentType.HENTAI)
 internal class TempleScan(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.TEMPLESCAN, pageSize = 20) {
@@ -77,7 +79,7 @@ internal class TempleScan(context: MangaLoaderContext) :
         ),
         availableContentTypes = emptySet(),
     )
-    
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = buildString {
             append("https://$domain/comics")
@@ -142,7 +144,7 @@ internal class TempleScan(context: MangaLoaderContext) :
                 )
             }
             .distinctBy { it.url }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.removePrefix("/comic/").trimEnd('/')
         val doc = webClient.httpGet("https://$domain/comic/$slug").parseHtml()
@@ -244,7 +246,7 @@ internal class TempleScan(context: MangaLoaderContext) :
             )
         }.distinctBy { it.url }.sortedBy { it.number }
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val url = "https://$domain${chapter.url}"
         val doc = webClient.httpGet(url).parseHtml()
@@ -289,7 +291,7 @@ internal class TempleScan(context: MangaLoaderContext) :
                 lower.contains("thumbnail")
         return !isChrome
     }
-    
+
     private fun parseDate(text: String?): Long {
         if (text.isNullOrBlank()) return 0L
         val lower = text.lowercase().trim()

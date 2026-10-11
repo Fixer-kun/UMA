@@ -41,7 +41,7 @@ import java.util.TimeZone
 // TODO: refractor and add future langauge support
 
 @MangaSourceParser("MANGADOTNET", "MangaDot")
-internal class Mangadotnet(context: MangaLoaderContext) :
+internal class MangaDot(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGADOTNET, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("mangadot.net")
@@ -173,7 +173,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
     )
 
     private val availableTags = GENRES.map { MangaTag(it, it, source) }.toSet()
-    
+
     override suspend fun getFilterOptions(): MangaListFilterOptions {
         return MangaListFilterOptions(
             availableTags = availableTags,

@@ -38,11 +38,11 @@ import tsuki.util.json.mapJSON
 import java.util.Calendar
 import java.util.EnumSet
 
-@MangaSourceParser("HEYTOON", "HeyToon", "en", ContentType.HENTAI)
-internal class HeyToon(context: MangaLoaderContext) :
+@MangaSourceParser("HEYTOON", "ToonHey", "en", ContentType.HENTAI)
+internal class ToonHey(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.HEYTOON, pageSize = 54, searchPageSize = 20) {
 
-    override val configKeyDomain = ConfigKey.Domain("heytoon.net")
+    override val configKeyDomain = ConfigKey.Domain("toonhey.net")
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)

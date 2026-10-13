@@ -321,21 +321,28 @@ abstract class MangaThemesia(
         if (chapterElements.isEmpty() && !withoutAjax) {
             return loadChaptersAjax(mangaUrl)
         }
-        return parseChapters(chapterElements)
+        return parseChapters(chapterElements, mangaUrl)
     }
 
     protected open suspend fun loadChaptersAjax(mangaUrl: String): List<MangaChapter> {
         val ajaxUrl = mangaUrl.toAbsoluteUrl(domain).removeSuffix("/") + "/ajax/chapters/"
         val doc = webClient.httpPost(ajaxUrl, emptyMap()).parseHtml()
-        return parseChapters(doc.select(chapterListSelector))
+        return parseChapters(doc.select(chapterListSelector), mangaUrl)
     }
 
-    private fun parseChapters(elements: Elements): List<MangaChapter> {
+    protected open fun transformChapterName(element: Element, name: String): String = name
+
+    protected open fun parseChapters(elements: Elements, mangaUrl: String = ""): List<MangaChapter> {
         return elements.mapNotNull { element ->
             val a = element.selectFirst("a") ?: return@mapNotNull null
-            val href = a.attrAsRelativeUrl("href")
-            if (href.isBlank()) return@mapNotNull null
-            val name = a.selectFirst(".chapternum")?.text() ?: a.ownText()
+            val rawHref = a.attr("href").trim()
+            val baseName = a.selectFirst(".chapternum")?.text() ?: a.ownText()
+            val name = transformChapterName(element, baseName)
+            val href = if (rawHref.isEmpty() || rawHref == "#") {
+                if (mangaUrl.isNotBlank()) "$mangaUrl#locked-${baseName.extractChapterNumber()}" else "#locked-${baseName.extractChapterNumber()}"
+            } else {
+                a.attrAsRelativeUrl("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            }
             val dateStr = element.selectFirst(".chapterdate")?.text()
             MangaChapter(
                 id = generateUid(href),

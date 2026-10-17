@@ -39,7 +39,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-
 import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.HttpStatusException
@@ -156,10 +155,6 @@ internal class Batcave(context: MangaLoaderContext) :
     }
 
     private suspend fun loadDocumentViaWebView(url: String): Document? {
-        // evaluateJs loads a BLANK page at the base URL, not the target URL, and does not
-        // await Promises. The only reliable way to get the real page content is a synchronous
-        // XHR from that same-origin blank page. If the WebView blocks sync XHR, we get
-        // "ERROR:..." back and fall through to requestBrowserAction.
         val script = """
             (function() {
                 try {

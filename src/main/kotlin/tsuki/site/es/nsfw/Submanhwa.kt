@@ -1,4 +1,4 @@
-package tsuki.site.es
+package tsuki.site.es.nsfw
 
 import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
@@ -16,6 +16,7 @@ import tsuki.model.MangaState
 import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
+import tsuki.model.ContentType
 
 import tsuki.util.generateUid
 import tsuki.util.parseHtml
@@ -28,7 +29,7 @@ import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
 
-@MangaSourceParser("SUBMANHWA", "Submanhwa", "es")
+@MangaSourceParser("SUBMANHWA", "Submanhwa", "es", ContentType.HENTAI)
 internal class Submanhwa(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.SUBMANHWA, pageSize = 20) {
 
@@ -219,7 +220,7 @@ internal class Submanhwa(context: MangaLoaderContext) :
             val name = a.text()
             val href = a.absUrl("href")
             if (href.isBlank()) return@mapNotNull null
-            
+
             val dateText = element.selectFirst(".ch-date")
                 ?.clone()
                 ?.apply { select(".ch-new").remove() }

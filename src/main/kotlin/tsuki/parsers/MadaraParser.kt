@@ -102,9 +102,21 @@ internal abstract class MadaraParser(
      *
      *  tagPrefix – the URL segment that immediately precedes the genre identifier in filter links.
      *              Used to extract the genre key from a link like /manga-genre/action/ -> "action".
+     *
+     *  extractGenreKey – converts the href of a genre link into the key stored on [MangaTag].
+     *                    Default strips everything before [tagPrefix] and trims the trailing slash.
+     *                    Override when the genre is encoded in the query string
+     *                    (e.g. ?genre=action -> "action") or under a different path segment.
      */
     protected open val listUrl = "manga/"
     protected open val tagPrefix = "manga-genre/"
+
+    protected open val selectGenres = "header ul.second-menu li a, div.genres_wrap ul.list-unstyled li a"
+
+    protected open fun extractGenreKey(href: String): String? {
+        val key = href.removeSuffix('/').substringAfterLast(tagPrefix, "")
+        return key.takeIf { it.isNotEmpty() }
+    }
 
     /**
      * Chapter list handling:
@@ -609,24 +621,19 @@ internal abstract class MadaraParser(
 
     protected open suspend fun fetchAvailableTags(): Set<MangaTag> {
         val doc = webClient.httpGet("https://$domain/$listUrl").parseHtml()
-        val body = doc.body()
-        val root1 = body.selectFirst("header")?.selectFirst("ul.second-menu")
-        val root2 = body.selectFirst("div.genres_wrap")?.selectFirst("ul.list-unstyled")
-        if (root1 == null && root2 == null) {
+        val links = doc.select(selectGenres)
+        if (links.isEmpty()) {
             doc.parseFailed("Root not found")
         }
-        val list = root1?.select("li").orEmpty() + root2?.select("li").orEmpty()
-        val keySet = HashSet<String>(list.size)
-        return list.mapNotNullToSet { li ->
-            val a = li.selectFirst("a") ?: return@mapNotNullToSet null
-            val href = a.attr("href").removeSuffix('/').substringAfterLast(tagPrefix, "")
-            if (href.isEmpty() || !keySet.add(href)) {
-                return@mapNotNullToSet null
-            }
+        val keySet = HashSet<String>(links.size)
+        return links.mapNotNullToSet { a ->
+            val key = extractGenreKey(a.attr("href")) ?: return@mapNotNullToSet null
+            if (!keySet.add(key)) return@mapNotNullToSet null
             MangaTag(
-                key = href,
+                key = key,
                 title = a.ownText().ifEmpty {
                     a.selectFirst(".menu-image-title")?.textOrNull()
+                        ?: a.selectFirst("span")?.textOrNull()
                 }?.toTitleCase(sourceLocale) ?: return@mapNotNullToSet null,
                 source = source,
             )

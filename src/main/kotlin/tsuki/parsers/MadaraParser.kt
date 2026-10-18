@@ -830,7 +830,7 @@ internal abstract class MadaraParser(
         }
     }
 
-    protected fun parseChapterDate(dateFormat: DateFormat, date: String?): Long {
+    protected open fun parseChapterDate(dateFormat: DateFormat, date: String?): Long {
         val d = date?.lowercase() ?: return 0
         return when {
 

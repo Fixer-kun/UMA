@@ -6,6 +6,7 @@ import tsuki.core.PagedMangaParser
 import tsuki.MangaParserAuthProvider
 import tsuki.exception.AuthRequiredException
 import tsuki.exception.ParseException
+import tsuki.network.CommonHeaders
 
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.ContentRating
@@ -50,6 +51,7 @@ import tsuki.util.mapChapters
 import androidx.collection.scatterSetOf
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import okhttp3.Headers
 import org.json.JSONObject
 import org.jsoup.HttpStatusException
 import org.jsoup.nodes.Document
@@ -60,10 +62,6 @@ import java.text.SimpleDateFormat
 import java.util.Base64
 import java.util.Calendar
 import java.util.EnumSet
-
-/**
- * Todo: make ContentType filter.
- */
 
 internal abstract class MadaraParser(
     context: MangaLoaderContext,
@@ -78,6 +76,13 @@ internal abstract class MadaraParser(
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
     }
+
+    protected open val referer: String? = null
+
+    override fun getRequestHeaders(): Headers =
+        super.getRequestHeaders().newBuilder().apply {
+            referer?.let { set(CommonHeaders.REFERER, it) }
+        }.build()
 
     /**
      * AJAX listing mode.

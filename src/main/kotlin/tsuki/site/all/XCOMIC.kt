@@ -41,6 +41,8 @@ import java.util.concurrent.ConcurrentHashMap
 private const val BROWSE_PAGE_SIZE = 24
 private const val CHAPTER_PAGE_SIZE = 100
 private const val COMIC_PROBES_PER_TITLE = 5
+private const val DETAILS_CACHE_TTL_MS = 5 * 60_000L
+private const val DETAILS_CACHE_MAX_SIZE = 32
 
 private val ID_QUERY by lazy {
     Regex("^id\\s*:?\\s*([a-zA-Z0-9\\-_]+)\\s*$", RegexOption.IGNORE_CASE)
@@ -247,8 +249,8 @@ private data class BrowseQuery(
 }
 
 @MangaSourceParser("XCOMIC", "XCOMIC")
-internal class XComic(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.XCOMIC, pageSize = BROWSE_PAGE_SIZE) {
+internal class XCOMIC(context: MangaLoaderContext) :
+    PagedMangaParser(context, MangaParserSource.XCOMIC, BROWSE_PAGE_SIZE) {
 
     override val configKeyDomain = ConfigKey.Domain("xcomic.me")
 
@@ -258,6 +260,9 @@ internal class XComic(context: MangaLoaderContext) :
     }
 
     private val probeCache = ConcurrentHashMap<String, ComicProbe>()
+
+    private data class CachedDetails(val manga: Manga, val expiresAt: Long)
+    private val detailsCache = ConcurrentHashMap<String, CachedDetails>()
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
         SortOrder.UPDATED,
@@ -420,103 +425,117 @@ internal class XComic(context: MangaLoaderContext) :
         return titleId to langs
     }
 
-    override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        val (titleId, langFilter) = splitMangaUrl(manga.url)
+    override suspend fun getDetails(manga: Manga): Manga {
+        val cacheKey = manga.url
+        detailsCache[cacheKey]?.let { cached ->
+            if (cached.expiresAt > System.currentTimeMillis()) return cached.manga
+            detailsCache.remove(cacheKey)
+        }
 
-        val title = fetchTitleNode(titleId)
-            ?: return@coroutineScope manga.copy(chapters = emptyList())
+        val result = coroutineScope {
+            val (titleId, langFilter) = splitMangaUrl(manga.url)
 
-        val resolved = if (title.isMerged == true &&
-            !title.mergedTo.isNullOrBlank() &&
-            title.mergedTo != titleId
-        ) {
-            fetchTitleNode(title.mergedTo) ?: title
-        } else title
+            val title = fetchTitleNode(titleId)
+                ?: return@coroutineScope manga.copy(chapters = emptyList())
 
-        val comicIds = resolved.comicIds.filter { it.isNotBlank() }
-        val probes = mutableMapOf<String, ComicProbe>()
-        coroutineScope {
-            comicIds.chunked(COMIC_PROBES_PER_TITLE).forEach { chunk ->
-                chunk.map { cid ->
-                    async {
-                        fetchComicProbe(cid)?.let { probes[cid] = it }
-                    }
+            val resolved = if (title.isMerged == true &&
+                !title.mergedTo.isNullOrBlank() &&
+                title.mergedTo != titleId
+            ) {
+                fetchTitleNode(title.mergedTo) ?: title
+            } else title
+
+            val comicIds = resolved.comicIds.filter { it.isNotBlank() }
+            val probes = mutableMapOf<String, ComicProbe>()
+            coroutineScope {
+                comicIds.chunked(COMIC_PROBES_PER_TITLE).forEach { chunk ->
+                    chunk.map { cid ->
+                        async {
+                            fetchComicProbe(cid)?.let { probes[cid] = it }
+                        }
+                    }.awaitAll()
+                }
+            }
+
+            val allLive = probes
+                .filterValues { it.isLive() }
+                .entries
+                .sortedByDescending { it.value.chapsNormal ?: 0 }
+
+            if (allLive.isEmpty()) {
+                return@coroutineScope manga.copy(chapters = emptyList())
+            }
+
+            val liveComics = if (langFilter.isEmpty()) {
+                allLive
+            } else {
+                allLive.filter { (_, probe) ->
+                    val lang = probe.translatedLanguage?.takeIf { it.isNotBlank() } ?: "_t"
+                    lang in langFilter
+                }.ifEmpty { allLive }
+            }
+
+            val chaptersByComic: List<Triple<String, ComicProbe, List<MangaChapter>>> =
+                liveComics.map { (comicId, probe) ->
+                    async { Triple(comicId, probe, fetchChapters(comicId)) }
                 }.awaitAll()
+
+            val candidateLabels: Map<String, String> = chaptersByComic.associate { (comicId, probe, chapters) ->
+                val langCode = probe.translatedLanguage?.takeIf { it.isNotBlank() } ?: "_t"
+                val langLabel = langDisplayName(langCode)
+                val uploader = chapters.firstNotNullOfOrNull { ch ->
+                    ch.scanlator?.takeIf { it.isNotBlank() }
+                } ?: probe.name?.takeIf { it.isNotBlank() }
+
+                val label = if (!uploader.isNullOrBlank() && !uploader.equals(langLabel, ignoreCase = true)) {
+                    "$langLabel • $uploader"
+                } else {
+                    langLabel
+                }
+                comicId to label
             }
-        }
 
-        val allLive = probes
-            .filterValues { it.isLive() }
-            .entries
-            .sortedByDescending { it.value.chapsNormal ?: 0 }
-
-        if (allLive.isEmpty()) {
-            return@coroutineScope manga.copy(chapters = emptyList())
-        }
-
-        val liveComics = if (langFilter.isEmpty()) {
-            allLive
-        } else {
-            allLive.filter { (_, probe) ->
-                val lang = probe.translatedLanguage?.takeIf { it.isNotBlank() } ?: "_t"
-                lang in langFilter
-            }.ifEmpty { allLive }
-        }
-
-        val chaptersByComic: List<Triple<String, ComicProbe, List<MangaChapter>>> =
-            liveComics.map { (comicId, probe) ->
-                async { Triple(comicId, probe, fetchChapters(comicId)) }
-            }.awaitAll()
-
-        val candidateLabels: Map<String, String> = chaptersByComic.associate { (comicId, probe, chapters) ->
-            val langCode = probe.translatedLanguage?.takeIf { it.isNotBlank() } ?: "_t"
-            val langLabel = langDisplayName(langCode)
-            val uploader = chapters.firstNotNullOfOrNull { ch ->
-                ch.scanlator?.takeIf { it.isNotBlank() }
-            } ?: probe.name?.takeIf { it.isNotBlank() }
-
-            val label = if (!uploader.isNullOrBlank() && !uploader.equals(langLabel, ignoreCase = true)) {
-                "$langLabel • $uploader"
-            } else {
-                langLabel
+            val labelCounts = candidateLabels.values.groupingBy { it }.eachCount()
+            val finalLabels: Map<String, String> = candidateLabels.mapValues { (comicId, base) ->
+                if ((labelCounts[base] ?: 0) > 1) {
+                    "$base · ${comicId.takeLast(4)}"
+                } else {
+                    base
+                }
             }
-            comicId to label
+
+            val allChapters = chaptersByComic
+                .flatMap { (comicId, _, chapters) ->
+                    val label = finalLabels[comicId]!!
+                    chapters.map { it.copy(branch = label, scanlator = label) }
+                }
+                .sortedWith(compareBy({ it.number }, { it.branch ?: "" }))
+
+            val primaryComicId = liveComics.first().key
+            val primaryComic = fetchComicNode(primaryComicId)
+
+            manga.copy(
+                title = resolved.title?.let { cleanTitle(it) } ?: manga.title,
+                altTitles = resolved.altTitles.toSet(),
+                description = primaryComic?.let { buildDescription(it) } ?: "",
+                authors = (resolved.authors + (primaryComic?.authorNames ?: emptyList())).toSet(),
+                tags = (resolved.genreIds + (primaryComic?.genres ?: emptyList())).mapTo(mutableSetOf()) {
+                    MangaTag(key = it, title = it.toTagCase(), source = source)
+                },
+                state = (primaryComic?.status() ?: resolved.status).toMangaState(),
+                rating = resolved.voteAvg?.div(10f)?.coerceIn(0f, 1f) ?: RATING_UNKNOWN,
+                contentRating = (resolved.contentRating ?: primaryComic?.contentRating).toContentRating(),
+                coverUrl = (resolved.coverLocalUrl ?: primaryComic?.urlCover ?: resolved.coverUrl)?.toAbsolute()
+                    ?: manga.coverUrl,
+                chapters = allChapters,
+            )
         }
 
-        val labelCounts = candidateLabels.values.groupingBy { it }.eachCount()
-        val finalLabels: Map<String, String> = candidateLabels.mapValues { (comicId, base) ->
-            if ((labelCounts[base] ?: 0) > 1) {
-                "$base · ${comicId.takeLast(4)}"
-            } else {
-                base
-            }
+        if (detailsCache.size >= DETAILS_CACHE_MAX_SIZE) {
+            detailsCache.minByOrNull { it.value.expiresAt }?.key?.let { detailsCache.remove(it) }
         }
-
-        val allChapters = chaptersByComic
-            .flatMap { (comicId, _, chapters) ->
-                val label = finalLabels[comicId]!!
-                chapters.map { it.copy(branch = label, scanlator = label) }
-            }
-            .sortedWith(compareBy({ it.number }, { it.branch ?: "" }))
-
-        val primaryComicId = liveComics.first().key
-        val primaryComic = fetchComicNode(primaryComicId)
-
-        manga.copy(
-            title = resolved.title?.let { cleanTitle(it) } ?: manga.title,
-            altTitles = resolved.altTitles.toSet(),
-            description = primaryComic?.let { buildDescription(it) } ?: "",
-            authors = (resolved.authors + (primaryComic?.authorNames ?: emptyList())).toSet(),
-            tags = (resolved.genreIds + (primaryComic?.genres ?: emptyList())).mapTo(mutableSetOf()) {
-                MangaTag(key = it, title = it.toTagCase(), source = source)
-            },
-            state = (primaryComic?.status() ?: resolved.status).toMangaState(),
-            rating = resolved.voteAvg?.div(10f)?.coerceIn(0f, 1f) ?: RATING_UNKNOWN,
-            contentRating = (resolved.contentRating ?: primaryComic?.contentRating).toContentRating(),
-            coverUrl = (resolved.coverLocalUrl ?: primaryComic?.urlCover ?: resolved.coverUrl)?.toAbsolute()
-                ?: manga.coverUrl,
-            chapters = allChapters,
-        )
+        detailsCache[cacheKey] = CachedDetails(result, System.currentTimeMillis() + DETAILS_CACHE_TTL_MS)
+        return result
     }
 
     private fun buildDescription(c: ComicNode): String =

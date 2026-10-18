@@ -27,16 +27,13 @@ import tsuki.util.urlEncoded
 import okhttp3.Headers
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.EnumSet
 import java.util.Locale
 import java.util.TimeZone
 
-// TODO: status filter does not work
-import tsuki.Broken
-
-@Broken("meh")
 @MangaSourceParser("TEMPLESCAN", "Temple Scan", "en", ContentType.HENTAI)
 internal class TempleScan(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.TEMPLESCAN, pageSize = 20) {
@@ -47,7 +44,7 @@ internal class TempleScan(context: MangaLoaderContext) :
         super.getRequestHeaders().newBuilder()
             .set(CommonHeaders.REFERER, "https://$domain/")
             .set(CommonHeaders.ORIGIN, "https://$domain")
-            .set(CommonHeaders.USER_AGENT, USER_AGENT)
+            .set(CommonHeaders.USER_AGENT, config[userAgentKey])
             .set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
             .set(CommonHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .set(CommonHeaders.SEC_FETCH_DEST, "document")
@@ -80,29 +77,35 @@ internal class TempleScan(context: MangaLoaderContext) :
         availableContentTypes = emptySet(),
     )
 
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
+    }
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val queryParts = mutableListOf<String>()
+        if (page > 1) queryParts.add("page=$page")
+
+        filter.states.firstOrNull()?.let { state ->
+            val statusValue = when (state) {
+                MangaState.ONGOING -> "Ongoing"
+                MangaState.FINISHED -> "Completed"
+                MangaState.PAUSED -> "Hiatus"
+                MangaState.ABANDONED -> "Canceled"
+                else -> null
+            }
+            if (statusValue != null) queryParts.add("status=$statusValue")
+        }
+
+        filter.query?.trim()?.takeIf { it.isNotBlank() }?.let { q ->
+            queryParts.add("q=${q.urlEncoded()}")
+        }
+
         val url = buildString {
             append("https://$domain/comics")
-            append("?page=")
-            append(page)
-
-            filter.states.firstOrNull()?.let { state ->
-                val statusValue = when (state) {
-                    MangaState.ONGOING -> "Ongoing"
-                    MangaState.FINISHED -> "Completed"
-                    MangaState.PAUSED -> "Hiatus"
-                    MangaState.ABANDONED -> "Canceled"
-                    else -> null
-                }
-                if (statusValue != null) {
-                    append("&status=")
-                    append(statusValue)
-                }
-            }
-
-            filter.query?.trim()?.takeIf { it.isNotBlank() }?.let { q ->
-                append("&q=")
-                append(q.urlEncoded())
+            if (queryParts.isNotEmpty()) {
+                append("?")
+                append(queryParts.joinToString("&"))
             }
         }
 
@@ -115,35 +118,58 @@ internal class TempleScan(context: MangaLoaderContext) :
         }
     }
 
-    private fun parseCards(doc: Document): List<Manga> =
-        doc.select("div.grid > div")
-            .filter { it.selectFirst("a[href*=/comic/]") != null }
-            .mapNotNull { card ->
-                val link = card.selectFirst("a[href*=/comic/]") ?: return@mapNotNull null
-                val href = link.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val title = card.selectFirst("h2")?.text()?.trim().orEmpty()
-                if (title.isBlank()) return@mapNotNull null
+    private fun parseCards(doc: Document): List<Manga> {
+        val fromGrid = doc.select("div.grid > div")
+            .mapNotNull { it.toCardManga() }
+            .distinctBy { it.url }
+        if (fromGrid.isNotEmpty()) return fromGrid
 
-                val cover = card.selectFirst("a[href*=/comic/] img")
-                    ?.let { it.attr("src").ifBlank { it.attr("data-src") } }
-                    ?.trim()?.takeIf { it.isNotBlank() }
-
-                Manga(
-                    id = generateUid(href),
-                    url = href,
-                    publicUrl = "https://$domain$href",
-                    title = title,
-                    altTitles = emptySet(),
-                    coverUrl = cover,
-                    authors = emptySet(),
-                    state = null,
-                    contentRating = null,
-                    tags = emptySet(),
-                    rating = RATING_UNKNOWN,
-                    source = source,
-                )
+        return doc.select("a[href*=/comic/]")
+            .filter { "/chapter-" !in it.attr("href") }
+            .mapNotNull { link ->
+                val container = link.closest("div, article, li") ?: link.parent() ?: link
+                container.toCardManga()
             }
             .distinctBy { it.url }
+    }
+
+    private fun Element.toCardManga(): Manga? {
+        val link = if (tagName() == "a" && "/comic/" in attr("href") && "/chapter-" !in attr("href")) {
+            this
+        } else {
+            selectFirst("a[href*=/comic/]")?.takeIf { "/chapter-" !in it.attr("href") }
+        } ?: return null
+
+        val href = link.attr("href").takeIf { it.isNotBlank() } ?: return null
+
+        val title = selectFirst("h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: selectFirst("h3")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: selectFirst("[class*=title]")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: link.attr("title").takeIf { it.isNotBlank() }
+            ?: return null
+
+        val cover = selectFirst("img")?.let { img ->
+            img.absUrl("src")
+                .ifBlank { img.absUrl("data-src") }
+                .ifBlank { img.absUrl("data-lazy-src") }
+                .takeIf { it.isNotBlank() }
+        }
+
+        return Manga(
+            id = generateUid(href),
+            url = href,
+            publicUrl = "https://$domain$href",
+            title = title,
+            altTitles = emptySet(),
+            coverUrl = cover,
+            authors = emptySet(),
+            state = null,
+            contentRating = null,
+            tags = emptySet(),
+            rating = RATING_UNKNOWN,
+            source = source,
+        )
+    }
 
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.removePrefix("/comic/").trimEnd('/')

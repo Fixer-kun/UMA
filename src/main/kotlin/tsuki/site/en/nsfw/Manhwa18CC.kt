@@ -31,6 +31,10 @@ import tsuki.util.urlEncoded
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import java.text.DateFormat
+import java.time.LocalDate
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatterBuilder
 import java.util.HashSet
 import java.util.Locale
 
@@ -52,6 +56,20 @@ internal class Manhwa18CC(context: MangaLoaderContext) :
     init {
         paginator.firstPage = 1
         searchPaginator.firstPage = 1
+    }
+
+    private val chapterDateFormatter = DateTimeFormatterBuilder()
+        .appendPattern("dd MMM [yyyy][yy]")
+        .toFormatter(Locale.ENGLISH)
+
+    override fun parseChapterDate(dateFormat: DateFormat, date: String?): Long {
+        if (date.isNullOrBlank()) return 0
+        return runCatching {
+            LocalDate.parse(date.trim(), chapterDateFormatter)
+                .atStartOfDay(ZoneOffset.UTC)
+                .toInstant()
+                .toEpochMilli()
+        }.getOrElse { super.parseChapterDate(dateFormat, date) }
     }
 
     override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
@@ -106,6 +124,7 @@ internal class Manhwa18CC(context: MangaLoaderContext) :
                     append("&page=")
                     append(page.toString())
                 }
+
                 else -> {
                     val tag = filter.tags.oneOrThrowIfMany()
                     if (filter.tags.isNotEmpty()) {

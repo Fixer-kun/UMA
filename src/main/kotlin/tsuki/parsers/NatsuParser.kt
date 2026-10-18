@@ -255,6 +255,12 @@ internal abstract class NatsuParser(
                     ?.optJSONObject(0)
                     ?.optString("source_url", null)
 
+                val scoreStr = obj.optJSONObject("metadata")
+                    ?.optJSONObject("meta")
+                    ?.optString("score")
+                    ?.takeIf { it.isNotBlank() && it != "0" }
+                val rating = scoreStr?.toFloatOrNull()?.let { (it / 10f).coerceIn(0f, 1f) } ?: RATING_UNKNOWN
+
                 val embedded = obj.optJSONObject("_embedded")
                 val terms = embedded?.optJSONArray("wp:term")
 
@@ -290,6 +296,7 @@ internal abstract class NatsuParser(
                     state = state,
                     authors = authors.toSet(),
                     tags = tags,
+                    rating = rating,
                     chapters = chapters,
                     altTitles = altTitles,
                 )
@@ -369,8 +376,22 @@ internal abstract class NatsuParser(
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-        return doc.select("main .relative section > img").map { img ->
-            val url = img.attrAsAbsoluteUrl("src").toRelativeUrl(domain)
+        val images = doc.select(
+            "main .kstorage-page, main .kstorage-chapter img, main .relative section > img"
+        ).distinct()
+
+        return images.mapNotNull { img ->
+            val raw = img.attrAsAbsoluteUrl("src").takeIf { it.isNotBlank() }
+                ?: img.attrAsAbsoluteUrl("data-src").takeIf { it.isNotBlank() }
+                ?: img.attrAsAbsoluteUrl("data-lazy-src").takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+
+            val url = if (raw.toHttpUrlOrNull()?.host?.endsWith(domain) == true) {
+                raw.toRelativeUrl(domain)
+            } else {
+                raw
+            }
+
             MangaPage(
                 id = generateUid(url),
                 url = url,

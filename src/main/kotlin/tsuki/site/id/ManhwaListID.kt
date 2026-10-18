@@ -8,4 +8,4 @@ import tsuki.model.MangaParserSource
 
 @MangaSourceParser("MANHWALISTID", "ManhwaList ID", "id")
 internal class ManhwaListID(context: MangaLoaderContext) :
-    MangaThemesia(context, MangaParserSource.MANHWALISTID, "manhwalist02.asia")
+    MangaThemesia(context, MangaParserSource.MANHWALISTID, "m1.manhwalist.my.id")

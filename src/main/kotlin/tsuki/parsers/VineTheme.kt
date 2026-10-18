@@ -1,16 +1,11 @@
 package tsuki.parsers
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import org.json.JSONArray
-import org.json.JSONObject
-import org.jsoup.Jsoup
-import org.jsoup.nodes.TextNode
 import tsuki.MangaLoaderContext
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
 import tsuki.exception.ParseException
+import tsuki.network.OkHttpWebClient
+
 import tsuki.model.ContentType
 import tsuki.model.Manga
 import tsuki.model.MangaChapter
@@ -23,10 +18,18 @@ import tsuki.model.MangaState
 import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
-import tsuki.network.OkHttpWebClient
+
 import tsuki.util.generateUid
 import tsuki.util.json.extractNextJs
 import tsuki.util.json.extractNextJsRsc
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONArray
+import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.TextNode
 import java.time.Instant
 import java.util.EnumSet
 import java.util.LinkedHashSet
@@ -233,8 +236,9 @@ abstract class VineTheme(
         val firstPage = detailObj.optJSONArray("chapters").asObjectList()
         val totalPages = detailObj.optInt("totalPages", 1)
 
-        val allChapters = if (firstPage.isEmpty() && totalPages > 1) {
-            buildList {
+        val allChapters = buildList {
+            addAll(firstPage)
+            if (totalPages > 1) {
                 for (p in 2..totalPages) {
                     val pageUrl = "$baseUrl/series/comic/$slug?sort=desc&page=$p"
                     val pageBody = runCatching {
@@ -244,8 +248,6 @@ abstract class VineTheme(
                     addAll(pageObj.optJSONArray("chapters").asObjectList())
                 }
             }
-        } else {
-            firstPage
         }
 
         return buildChapterList(allChapters, slug)

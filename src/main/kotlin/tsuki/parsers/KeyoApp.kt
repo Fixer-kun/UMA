@@ -262,7 +262,7 @@ abstract class KeyoApp(
     protected open val artistSelector: String = "div:has(span:containsOwn(Artist)) ~ div"
     protected open val genreSelector: String = "div:has(>h1) a[href*='genre=']"
     protected open val typeSelector: String = "div:has(span:containsOwn(Type)) ~ div"
-    protected open val dateSelector: String = ".text-xs"
+    protected open val dateSelector: String = "div.text-xs"
     protected open val paidChapterSelector: String = "img[alt~=Coin]"
 
     override suspend fun getDetails(manga: Manga): Manga {

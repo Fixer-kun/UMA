@@ -8,6 +8,7 @@ import tsuki.exception.ParseException
 import tsuki.network.OkHttpWebClient
 
 import tsuki.model.ContentType
+import tsuki.model.Favicons
 import tsuki.model.Manga
 import tsuki.model.MangaChapter
 import tsuki.model.MangaListFilter
@@ -22,22 +23,38 @@ import tsuki.model.SortOrder
 
 import tsuki.util.attrAsAbsoluteUrl
 import tsuki.util.attrAsRelativeUrl
+import tsuki.util.await
 import tsuki.util.generateUid
+import tsuki.util.mapNotNullToSet
 import tsuki.util.parseHtml
+import tsuki.util.runCatchingCancellable
 import tsuki.util.toAbsoluteUrl
+import tsuki.util.urlEncoded
 
-import okhttp3.FormBody
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
+import org.json.JSONTokener
+import org.jsoup.HttpStatusException
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
+import java.util.TimeZone
+import kotlin.time.Duration.Companion.milliseconds
 
 @MangaSourceParser("BATCAVE", "Batcave", "en", ContentType.COMICS)
 internal class Batcave(context: MangaLoaderContext) :
@@ -45,29 +62,43 @@ internal class Batcave(context: MangaLoaderContext) :
 
     override val configKeyDomain = ConfigKey.Domain("batcave.biz")
 
-    private val dateFormat = SimpleDateFormat("dd.MM.yyyy", Locale.ENGLISH)
+    private val dateFormat = SimpleDateFormat("dd.MM.yyyy", Locale.US)
 
     @Volatile
-    private var genreList: List<Pair<String, Int>>? = null
+    private var availableTags: Set<MangaTag>? = null
     private var filterFetchFailed = false
 
     private val rawHttpClient: OkHttpClient by lazy {
         context.httpClient.newBuilder()
             .addInterceptor(::refererInterceptor)
-            .addInterceptor(::dleGuardInterceptor)
             .build()
     }
-
-    override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
-        .set("Sec-Fetch-Dest", "document")
-        .set("Sec-Fetch-Mode", "navigate")
-        .set("Sec-Fetch-Site", "none")
-        .set("Sec-Fetch-User", "?1")
-        .build()
 
     private val apiClient: OkHttpWebClient by lazy {
         OkHttpWebClient(rawHttpClient, source)
     }
+
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
+    }
+
+    override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+        SortOrder.UPDATED,
+        SortOrder.POPULARITY,
+        SortOrder.NEWEST,
+        SortOrder.ALPHABETICAL,
+    )
+
+    override val filterCapabilities: MangaListFilterCapabilities
+        get() = MangaListFilterCapabilities(
+            isSearchSupported = true,
+            isMultipleTagsSupported = true,
+        )
+
+    override suspend fun getFilterOptions() = MangaListFilterOptions(
+        availableTags = fetchTags(),
+    )
 
     private fun refererInterceptor(chain: okhttp3.Interceptor.Chain): Response {
         val request = chain.request()
@@ -79,231 +110,363 @@ internal class Batcave(context: MangaLoaderContext) :
         return chain.proceed(request.newBuilder().header("Referer", referer).build())
     }
 
-    private fun dleGuardInterceptor(chain: okhttp3.Interceptor.Chain): Response {
-        val originalRequest = chain.request()
-        val response = chain.proceed(originalRequest)
-        if (response.request.url.pathSegments.firstOrNull() != "_c") {
-            return response
-        }
-        response.close()
-        val url = if (originalRequest.method == "GET") {
-            originalRequest.url.toString()
-        } else {
-            "https://$domain/"
-        }
-        context.requestBrowserAction(this, url)
+    private val dleGuardMutex = Mutex()
+
+    @Volatile
+    private var lastGuardSolveAt = 0L
+
+    private companion object {
+        const val DLE_GUARD_COOKIE = "__guard_trust"
+        const val GUARD_TRUST_WINDOW_MS = 5_000L
+        const val DLE_GUARD_MAX_NONCE = 1_000_000
+        const val DLE_GUARD_MIN_WORK_MS = 50L
+        val DLE_GUARD_TOKEN_REGEX = Regex("""\btoken:\s*"([^"]+)"""")
     }
 
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(userAgentKey)
+    private suspend fun captureDocument(
+        initialUrl: String,
+        allowBrowserAction: Boolean = true,
+    ): Document {
+        tryHttpDocument(initialUrl)?.let { return it }
+
+        if (solveDleGuard(initialUrl)) {
+            tryHttpDocument(initialUrl)?.let { return it }
+        }
+
+        loadDocumentViaWebView(initialUrl)?.let { return it }
+
+        if (allowBrowserAction) {
+            context.requestBrowserAction(this, initialUrl)
+        }
+        throw ParseException("Failed to load page via webview", initialUrl)
     }
 
-    override val availableSortOrders: Set<SortOrder> = EnumSet.of(
-        SortOrder.POPULARITY,
-        SortOrder.UPDATED,
-    )
+    private suspend fun tryHttpDocument(url: String): Document? {
+        val response = runCatchingCancellable { apiClient.httpGet(url) }.getOrNull() ?: return null
+        return response.use { res ->
+            if (res.request.url.isDleGuard()) return null
+            val doc = runCatchingCancellable { res.parseHtml() }.getOrNull() ?: return null
 
-    override val filterCapabilities = MangaListFilterCapabilities(
-        isSearchSupported = true,
-        isMultipleTagsSupported = false,
-        isYearSupported = false,
-    )
+            if (hasValidBatCaveContent(doc)) return doc
 
-    private suspend fun fetchFilters() {
-        if (genreList != null) return
-        if (filterFetchFailed) return
-
-        try {
-            val doc = apiClient.httpGet("https://$domain/comix").parseHtml()
-            val script = doc.selectFirst("script:containsData(window.__XFILTER__)")?.data()
-                ?: throw ParseException("Filter data not found", "https://$domain/comix")
-
-            val rawJson = script
-                .substringAfter("window.__XFILTER__ = ")
-                .substringBeforeLast(";")
-                .trim()
-            val root = JSONObject(rawJson)
-            val filterItems = root.getJSONObject("filter_items")
-
-            genreList = parseFilterValues(filterItems)
-        } catch (_: Exception) {
-            filterFetchFailed = true
+            if (isActiveCloudflareChallenge(doc.outerHtml())) return null
+            doc
         }
     }
 
-    private fun parseFilterValues(filterItems: JSONObject): List<Pair<String, Int>> {
-        val obj = filterItems.optJSONObject("g") ?: return emptyList()
-        val values = obj.optJSONArray("values") ?: return emptyList()
-        val result = mutableListOf<Pair<String, Int>>()
-        for (i in 0 until values.length()) {
-            val item = values.getJSONObject(i)
-            result.add(item.getString("value") to item.getInt("id"))
-        }
-        return result
+    private suspend fun loadDocumentViaWebView(url: String): Document? {
+        val script = """
+            (function() {
+                try {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('GET', ${JSONObject.quote(url)}, false);
+                    xhr.send();
+                    if (xhr.status >= 200 && xhr.status < 400) {
+                        return xhr.responseText;
+                    }
+                    return "ERROR:HTTP_" + xhr.status;
+                } catch (e) {
+                    return "ERROR:" + (e && e.message ? e.message : String(e));
+                }
+            })();
+        """.trimIndent()
+
+        val raw = context.evaluateJs(url, script) ?: return null
+        val html = raw.decodeJsString() ?: return null
+        if (html.startsWith("ERROR:") || html.isBlank()) return null
+
+        val doc = Jsoup.parse(html, url)
+        if (hasValidBatCaveContent(doc)) return doc
+        if (isDleGuardPage(doc)) return null
+        if (isActiveCloudflareChallenge(html)) return null
+        return doc
     }
 
-    override suspend fun getFilterOptions(): MangaListFilterOptions {
-        fetchFilters()
-        val tags = mutableSetOf<MangaTag>()
-        genreList?.forEach { (name, id) ->
-            tags += MangaTag(name, "g_$id", source)
+    private fun String.decodeJsString(): String? {
+        if (this == "null") return null
+        return runCatching { JSONTokener(this).nextValue() as? String }.getOrNull()
+    }
+
+    private suspend fun solveDleGuard(url: String): Boolean = dleGuardMutex.withLock {
+        if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
+            return@withLock true
         }
-        return MangaListFilterOptions(
-            availableTags = tags,
+        val solved = runCatchingCancellable { solveDleGuardChallenge(url) }.getOrDefault(false)
+        if (solved) {
+            lastGuardSolveAt = System.currentTimeMillis()
+        }
+        solved
+    }
+
+    private suspend fun solveDleGuardChallenge(url: String): Boolean {
+        val request = Request.Builder()
+            .get()
+            .url(url)
+            .build()
+        val token = rawHttpClient.newCall(request).await().use { response ->
+            if (!response.request.url.isDleGuard()) return true
+            DLE_GUARD_TOKEN_REGEX.find(response.body?.string() ?: return false)?.groupValues?.get(1)
+        } ?: return false
+        val startedAt = System.currentTimeMillis()
+        val digest = MessageDigest.getInstance("SHA-256")
+        val nonce = (0 until DLE_GUARD_MAX_NONCE).firstOrNull { n ->
+            digest.digest("$token:$n".toByteArray())[0] == 0.toByte()
+        } ?: return false
+        val hash = digest.digest("$token:$nonce".toByteArray()).joinToString("") { "%02x".format(it) }
+        delay((maxOf(DLE_GUARD_MIN_WORK_MS, (nonce / 50 + 1) * 17L) - (System.currentTimeMillis() - startedAt)).milliseconds)
+        val form = mapOf(
+            "token" to token.urlEncoded(),
+            "mode" to "modern",
+            "workTime" to (System.currentTimeMillis() - startedAt).toString(),
+            "iterations" to (nonce + 1).toString(),
+            "hasCrypto" to "1",
+            "pow_nonce" to nonce.toString(),
+            "pow_hash" to hash,
+            "webdriver" to "0",
+            "touch" to "1",
+            "screen_w" to "412",
+            "screen_h" to "915",
+            "screen_cd" to "24",
+            "tz" to (-TimeZone.getDefault().getOffset(startedAt) / 60_000).toString(),
+            "dpr" to "2.625",
+            "cdp" to "0",
+            "cdpf" to "",
         )
+        val postRequest = Request.Builder()
+            .url("https://$domain/_v".toHttpUrl())
+            .post(
+                form.entries.joinToString("&") { (k, v) ->
+                    "${k.urlEncoded()}=${v.urlEncoded()}"
+                }.toRequestBody("application/x-www-form-urlencoded".toMediaTypeOrNull())
+            )
+            .build()
+        rawHttpClient.newCall(postRequest).await().close()
+        return hasDleGuardTrust()
     }
+
+    private fun hasDleGuardTrust(): Boolean {
+        val cookies = rawHttpClient.cookieJar.loadForRequest("https://$domain/".toHttpUrl())
+        return cookies.any { it.name == DLE_GUARD_COOKIE }
+    }
+
+    private fun HttpUrl.isDleGuard(): Boolean = pathSegments.firstOrNull() == "_c"
+
+    private fun isDleGuardPage(doc: Document): Boolean =
+        doc.location().toHttpUrlOrNull()?.isDleGuard() == true ||
+                doc.selectFirst("script:containsData(pow_nonce)") != null
+
+    private fun hasValidBatCaveContent(doc: Document): Boolean {
+        if (isDleGuardPage(doc)) return false
+        return doc.select("#dle-content > .readed, div.readed.d-flex.short").isNotEmpty() ||
+                doc.select("script:containsData(__DATA__)").isNotEmpty() ||
+                doc.select("script:containsData(__XFILTER__)").isNotEmpty() ||
+                doc.select("h1.serie-title").isNotEmpty() ||
+                doc.title().contains("BatCave", ignoreCase = true)
+    }
+
+    private fun isActiveCloudflareChallenge(html: String): Boolean {
+        if (html.length < 100) return true
+        val lower = html.lowercase()
+        return (lower.contains("just a moment") && lower.contains("cloudflare")) ||
+                (lower.contains("checking your browser") && lower.contains("cloudflare")) ||
+                lower.contains("cf-browser-verification") ||
+                lower.contains("cf-chl-opt")
+    }
+
+    override suspend fun getFavicons(): Favicons {
+        if (!hasDleGuardTrust()) {
+            solveDleGuard("https://$domain/")
+        }
+        return super.getFavicons()
+    }
+
+    override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
+        .set("Sec-Fetch-Dest", "document")
+        .set("Sec-Fetch-Mode", "navigate")
+        .set("Sec-Fetch-Site", "none")
+        .set("Sec-Fetch-User", "?1")
+        .build()
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        if (!filter.query.isNullOrBlank()) {
-            return searchManga(page, filter.query!!)
-        }
-
-        val urlBuilder = StringBuilder().apply {
-            append("https://$domain/ComicList/")
-            val gIds = filter.tags.filter { it.key.startsWith("g_") }.map { it.key.removePrefix("g_") }
-            if (gIds.isNotEmpty()) append("g=${gIds.joinToString(",")}/")
-            append("sort")
-            if (page > 1) append("/page/$page/")
-        }
-        val url = urlBuilder.toString()
-
-        val sortPair = when (order) {
+        val pagePath = if (page > 1) "page/$page/" else ""
+        val (sortBy, direction) = when (order) {
             SortOrder.POPULARITY -> "rating" to "desc"
-            SortOrder.UPDATED -> "date" to "desc"
-            else -> "" to ""
+            SortOrder.NEWEST -> "date" to "desc"
+            SortOrder.ALPHABETICAL -> "title" to "asc"
+            else -> "editdate" to "desc"
         }
-
-        return if (sortPair.first.isEmpty()) {
-            parseMangaList(apiClient.httpGet(url).parseHtml())
-        } else {
-            val formBody = FormBody.Builder()
-                .add("dlenewssortby", sortPair.first)
-                .add("dledirection", sortPair.second)
-                .add("set_new_sort", "dle_sort_xfilter")
-                .add("set_direction_sort", "dle_direction_xfilter")
-                .build()
-            val request = Request.Builder().url(url).post(formBody).build()
-            val response = rawHttpClient.newCall(request).execute()
-            parseMangaList(response.parseHtml())
-        }
-    }
-
-    private suspend fun searchManga(page: Int, query: String): List<Manga> {
-        val url = "https://$domain".toHttpUrl().newBuilder()
-            .addPathSegment("search")
-            .addPathSegment(query)
-            .apply {
+        return when {
+            !filter.query.isNullOrEmpty() -> {
+                val url = "https://$domain".toHttpUrl().newBuilder()
+                    .addPathSegment("search")
+                    .addPathSegment(filter.query!!.trim())
                 if (page > 1) {
-                    addPathSegment("page")
-                    addPathSegment(page.toString())
-                    addPathSegment("")
+                    url.addPathSegment("page").addPathSegment(page.toString())
                 }
+                parseReadedList(fetchDocument(url.addPathSegment("").build().toString()))
             }
-            .build()
-        val html = apiClient.httpGet(url.toString()).body?.string() ?: return emptyList()
-        val doc = Jsoup.parse(html, "https://$domain")
-        return doc.select("#dle-content > .readed").map { element ->
-            val a = element.selectFirst(".readed__title > a") ?: return@map null
-            Manga(
-                id = generateUid(a.attrAsRelativeUrl("href")),
-                url = a.attrAsRelativeUrl("href"),
-                publicUrl = a.absUrl("href"),
-                title = a.ownText(),
-                altTitles = emptySet(),
-                rating = RATING_UNKNOWN,
-                contentRating = null,
-                coverUrl = element.selectFirst(".readed__img img")?.attrAsAbsoluteUrl("data-src"),
-                tags = emptySet(),
-                state = null,
-                authors = emptySet(),
-                source = source,
-            )
-        }.filterNotNull()
+
+            filter.tags.isNotEmpty() -> {
+                val filterPath = buildString {
+                    append("g=").append(filter.tags.joinToString(",") { it.key }).append('/')
+                }
+                val form = mapOf(
+                    "dlenewssortby" to sortBy,
+                    "dledirection" to direction,
+                    "set_new_sort" to "dle_sort_xfilter",
+                    "set_direction_sort" to "dle_direction_xfilter",
+                )
+                parseReadedList(fetchDocument("https://$domain/ComicList/$filterPath$pagePath", form))
+            }
+
+            order == SortOrder.UPDATED -> parseLatestList(fetchDocument("https://$domain/$pagePath"))
+
+            else -> {
+                val form = mapOf(
+                    "dlenewssortby" to sortBy,
+                    "dledirection" to direction,
+                    "set_new_sort" to "dle_sort_cat_1",
+                    "set_direction_sort" to "dle_direction_cat_1",
+                )
+                parseReadedList(fetchDocument("https://$domain/comix/$pagePath", form))
+            }
+        }
     }
 
-    private fun parseMangaList(doc: org.jsoup.nodes.Document): List<Manga> {
-        return doc.select("#dle-content > .readed").map { element ->
-            val a = element.selectFirst(".readed__title > a") ?: return@map null
-            val cover = element.selectFirst("img")?.attrAsAbsoluteUrl("data-src")
-            Manga(
-                id = generateUid(a.attrAsRelativeUrl("href")),
-                url = a.attrAsRelativeUrl("href"),
-                publicUrl = a.absUrl("href"),
-                title = a.ownText(),
-                altTitles = emptySet(),
-                rating = RATING_UNKNOWN,
-                contentRating = null,
-                coverUrl = cover,
-                tags = emptySet(),
-                state = null,
-                authors = emptySet(),
-                source = source,
-            )
-        }.filterNotNull()
+    private suspend fun fetchDocument(url: String, form: Map<String, String>? = null): Document {
+        var guardSolved = false
+        while (true) {
+            val result = runCatchingCancellable {
+                if (form == null) apiClient.httpGet(url) else apiClient.httpPost(url.toHttpUrl(), form)
+            }
+            val response = result.getOrNull()
+            val error = result.exceptionOrNull()
+            val isGuarded = response?.request?.url?.isDleGuard() == true ||
+                    (error as? HttpStatusException)?.url?.toHttpUrlOrNull()?.isDleGuard() == true
+            if (!isGuarded) {
+                if (error != null) throw error
+                val doc = checkNotNull(response).parseHtml()
+                if (isActiveCloudflareChallenge(doc.outerHtml())) {
+                    context.requestBrowserAction(this, url)
+                }
+                return doc
+            }
+            response?.close()
+            if (guardSolved || !solveDleGuard(if (form == null) url else "https://$domain/")) {
+                context.requestBrowserAction(this, url)
+            }
+            guardSolved = true
+        }
     }
 
-    private val detailsCacheLock = Any()
-    private val detailsCache = object : LinkedHashMap<String, Manga>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Manga>?): Boolean = size > 10
+    private fun parseLatestList(doc: Document): List<Manga> {
+        return doc.select("#content-load > .latest.grid-item").mapNotNull { item ->
+            val titleElement = item.selectFirst(".latest__title > a") ?: return@mapNotNull null
+            val title = titleElement.ownText().trim().ifEmpty { return@mapNotNull null }
+            val href = titleElement.attrAsRelativeUrl("href")
+            val img = item.selectFirst(".latest__img img")
+            Manga(
+                id = generateUid(href),
+                url = href,
+                publicUrl = titleElement.attrAsAbsoluteUrl("href"),
+                title = title,
+                altTitles = emptySet(),
+                authors = emptySet(),
+                description = null,
+                tags = emptySet(),
+                rating = RATING_UNKNOWN,
+                state = null,
+                coverUrl = img?.attrAsAbsoluteUrl("src") ?: img?.attrAsAbsoluteUrl("data-src"),
+                contentRating = null,
+                source = source,
+            )
+        }
+    }
+
+    private fun parseReadedList(doc: Document): List<Manga> {
+        val items = doc.select("#dle-content > .readed").ifEmpty { doc.select("div.readed.d-flex.short") }
+        return items.mapNotNull { item ->
+            val titleElement = item.selectFirst(".readed__title > a") ?: return@mapNotNull null
+            val img = item.selectFirst(".readed__img img")
+            val href = titleElement.attrAsRelativeUrl("href")
+            Manga(
+                id = generateUid(href),
+                url = href,
+                publicUrl = titleElement.attrAsAbsoluteUrl("href"),
+                title = titleElement.ownText().ifEmpty { titleElement.text() },
+                altTitles = emptySet(),
+                authors = emptySet(),
+                description = null,
+                tags = emptySet(),
+                rating = RATING_UNKNOWN,
+                state = null,
+                coverUrl = img?.attrAsAbsoluteUrl("data-src") ?: img?.attrAsAbsoluteUrl("src"),
+                contentRating = null,
+                source = source,
+            )
+        }
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        synchronized(detailsCacheLock) {
-            detailsCache[manga.url]?.let { return it }
-        }
+        val doc = captureDocument(manga.url.toAbsoluteUrl(domain))
 
-        val doc = apiClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+        val scriptData = extractScriptJson(doc, "__DATA__")
+            ?: throw ParseException("Script data not found", manga.url)
 
-        val title = doc.selectFirst("header.page__header h1")?.text() ?: manga.title
-        val cover = doc.selectFirst("div.page__poster img")?.absUrl("src")
-        val description = doc.selectFirst("div.page__text")?.text()
+        val jsonData = JSONObject(scriptData)
+        val newsId = jsonData.getLong("news_id")
+        val chaptersJson = jsonData.getJSONArray("chapters")
 
-        val author = doc.selectFirst(".page__list > li:has(> div:contains(Writer)) a")?.text()
-            ?: doc.selectFirst(".page__list > li:has(> div:contains(Writer))")?.ownText()
-        val state = when (doc.selectFirst(".page__list > li:has(> div:contains(Release type))")?.ownText()?.trim()) {
-            "Ongoing" -> MangaState.ONGOING
-            else -> MangaState.FINISHED
-        }
-        val tags = doc.select("div.page__tags a").map { a ->
-            MangaTag(a.text(), a.text().lowercase().replace(" ", "-"), source)
-        }.toSet() + MangaTag("Comic", "comic", source)
-
-        val script = doc.selectFirst("script:containsData(window.__DATA__)")?.data()
-            ?: throw ParseException("Chapter data script not found", manga.url)
-        val json = JSONObject(
-            script.substringAfter("window.__DATA__ = ").substringBeforeLast(";").trim()
-        )
-        val newsId = json.getLong("news_id")
-        val chaptersArray = json.getJSONArray("chapters")
-        val chapters = (0 until chaptersArray.length()).map { i ->
-            val ch = chaptersArray.getJSONObject(i)
+        val chapters = List(chaptersJson.length()) { i ->
+            val chapter = chaptersJson.getJSONObject(i)
+            val chapterId = chapter.getLong("id")
             MangaChapter(
-                id = generateUid("/reader/$newsId/${ch.getInt("id")}"),
-                url = "/reader/$newsId/${ch.getInt("id")}",
-                title = ch.optString("title"),
-                number = ch.optDouble("posi", 0.0).toFloat(),
-                volume = 0,
-                scanlator = null,
-                uploadDate = dateFormat.parseSafe(ch.optString("date")),
-                branch = null,
+                id = generateUid("$newsId/$chapterId"),
+                url = "/reader/$newsId/$chapterId",
+                number = chapter.optDouble("posi", 0.0).toFloat(),
+                title = chapter.optString("title").takeIf { it.isNotEmpty() },
+                uploadDate = dateFormat.parseSafe(chapter.optString("date")),
                 source = source,
+                scanlator = null,
+                branch = null,
+                volume = 0,
             )
         }.reversed()
 
-        val result = manga.copy(
-            title = title,
-            coverUrl = cover ?: manga.coverUrl,
-            description = description,
+        val author = doc.selectFirst("li:contains(Publisher:)")
+            ?.text()
+            ?.substringAfter("Publisher:")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        val state = when (
+            doc.selectFirst("li:contains(Release type:)")?.text()?.substringAfter("Release type:")?.trim()
+        ) {
+            "Ongoing" -> MangaState.ONGOING
+            else -> MangaState.FINISHED
+        }
+
+        val tagLinks = doc.getElementsByAttributeValueContaining("href", "/genres/")
+        val tags = if (tagLinks.isNotEmpty()) {
+            availableTags?.let { allTags ->
+                tagLinks.mapNotNullToSet { a ->
+                    val tagName = a.text()
+                    allTags.find { it.title.equals(tagName, ignoreCase = true) }
+                }
+            }
+        } else {
+            null
+        }
+
+        return manga.copy(
+            title = doc.selectFirst("header.page__header h1")?.text() ?: manga.title,
+            coverUrl = manga.coverUrl?.takeIf { it.isNotEmpty() }
+                ?: doc.selectFirst("div.page__poster img")?.attrAsAbsoluteUrl("src"),
             authors = setOfNotNull(author),
             state = state,
-            tags = tags,
             chapters = chapters,
+            description = doc.select("div.page__text.full-text.clearfix").text().takeIf { it.isNotEmpty() },
+            tags = tags ?: manga.tags,
         )
-        synchronized(detailsCacheLock) {
-            detailsCache[manga.url] = result
-        }
-        return result
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
@@ -334,6 +497,75 @@ internal class Batcave(context: MangaLoaderContext) :
     }
 
     override suspend fun getPageUrl(page: MangaPage): String = page.url
+
+    private suspend fun fetchTags(): Set<MangaTag> {
+        availableTags?.let { return it }
+        if (filterFetchFailed) return emptySet()
+        try {
+            val doc = captureDocument("https://$domain/comix/")
+            val scriptData = doc.selectFirst("script:containsData(__XFILTER__)")?.data()
+                ?: throw ParseException("Filter data not found", "https://$domain/comix")
+            val genresJson = scriptData.substringAfter("\"g\":{").substringBefore("}}}") + "}"
+            val genresObj = JSONObject("{$genresJson}")
+            val valuesArray = genresObj.getJSONArray("values")
+
+            val tags = buildSet {
+                repeat(valuesArray.length()) { i ->
+                    val genre = valuesArray.getJSONObject(i)
+                    add(
+                        MangaTag(
+                            key = genre.getInt("id").toString(),
+                            title = genre.getString("value").replaceFirstChar { it.uppercase() },
+                            source = source,
+                        )
+                    )
+                }
+            }
+            availableTags = tags
+            return tags
+        } catch (_: Exception) {
+            filterFetchFailed = true
+            return emptySet()
+        }
+    }
+
+    @Suppress("SameParameterValue")
+    private fun extractScriptJson(doc: Document, varName: String): String? {
+        val assignment = Regex("""(?:window\.)?${Regex.escape(varName)}\s*=\s*(?=\{)""")
+        for (script in doc.select("script")) {
+            val data = script.data()
+            for (match in assignment.findAll(data)) {
+                extractBalancedObject(data, match.range.last + 1)?.let { return it }
+            }
+        }
+        doc.selectFirst("script[type=application/json][id*=${varName.trim('_')}]")
+            ?.data()?.trim()?.takeIf { it.startsWith("{") }
+            ?.let { return it }
+        return null
+    }
+
+    private fun extractBalancedObject(text: String, start: Int): String? {
+        var depth = 0
+        var quote = 0.toChar()
+        var escaped = false
+        for (i in start until text.length) {
+            val c = text[i]
+            if (quote != 0.toChar()) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == quote -> quote = 0.toChar()
+                }
+                continue
+            }
+            when (c) {
+                '"', '\'' -> quote = c
+                '{' -> depth++
+                '}' -> if (--depth == 0) return text.substring(start, i + 1)
+            }
+        }
+        return null
+    }
 
     private fun SimpleDateFormat.parseSafe(date: String?): Long =
         if (date.isNullOrBlank()) 0L else runCatching { parse(date)?.time ?: 0L }.getOrDefault(0L)

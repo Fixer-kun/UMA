@@ -54,7 +54,7 @@ import kotlinx.coroutines.sync.withLock
 internal class Kagane(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.KAGANE, pageSize = 35) {
 
-    override val configKeyDomain = ConfigKey.Domain("kagane.to")
+    override val configKeyDomain = ConfigKey.Domain("kagane.org", "kagane.si", "kagane.cx", "kagane.moe", "kagane.net")
     private val apiUrl = "https://$domain"
 
     private val dataSaverKey = ConfigKey.PreferredImageServer(
@@ -126,8 +126,17 @@ internal class Kagane(context: MangaLoaderContext) :
                 ContentType.COMICS,
                 ContentType.OTHER,
             ),
-            availableLocales = KAGANE_LANGS,
-        )
+            availableLocales = KAGANE_LANGS.mapTo(LinkedHashSet()) { code ->
+                when (code) {
+                    "zh-Hans" -> Locale.SIMPLIFIED_CHINESE
+                    "zh-Hant" -> Locale.TRADITIONAL_CHINESE
+                    else -> {
+                        val parts = code.split('-', limit = 2)
+                        if (parts.size == 1) Locale(parts[0]) else Locale(parts[0], parts[1])
+                    }
+                }
+            },
+            )
     }
 
     @Volatile
@@ -183,10 +192,11 @@ internal class Kagane(context: MangaLoaderContext) :
             put("Unofficial")
             put("Mixed")
         })
+
+        val langCode = filter.locale?.toKaganeLangCode()
         jsonBody.put("content_lang", JSONArray().apply {
-            val selectedLocale = filter.locale
-            if (selectedLocale != null) {
-                put(selectedLocale.toKaganeLangCode())
+            if (langCode != null) {
+                put(langCode)
             } else {
                 KAGANE_LANGS.forEach(::put)
             }
@@ -436,6 +446,7 @@ internal class Kagane(context: MangaLoaderContext) :
             ?: manga.coverUrl
 
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
+
         fun parseChapters(content: JSONArray): List<MangaChapter> {
             val chapters = ArrayList<MangaChapter>(content.length())
             for (i in 0 until content.length()) {
@@ -488,8 +499,7 @@ internal class Kagane(context: MangaLoaderContext) :
                 )
             }
             return chapters.sortedWith(
-                compareBy<MangaChapter> { it.number <= 0f }
-                    .thenBy { it.number }
+                compareBy<MangaChapter> { it.number }
                     .thenBy { it.volume }
                     .thenBy { it.title.orEmpty() },
             )
@@ -502,16 +512,63 @@ internal class Kagane(context: MangaLoaderContext) :
                 ?: json.optJSONArray("content")
                 ?: JSONArray(),
         )
+
         if (chapters.isEmpty()) {
-            val chaptersUrl = "$apiUrl/api/v2/series/$seriesId/books/list"
-            val chapterResp = webClient.httpGet(chaptersUrl, headers).parseJson()
-            chapters = parseChapters(
-                chapterResp.optJSONArray("series_books")
-                    ?: chapterResp.optJSONArray("seriesBooks")
-                    ?: chapterResp.optJSONArray("content")
-                    ?: JSONArray(),
-            )
+            val listUrl = "$apiUrl/api/v2/series/$seriesId/books/list"
+            val listResp = runCatching {
+                executeWithCloudflareCheck(
+                    url = listUrl,
+                    block = { webClient.httpGet(listUrl, headers) },
+                    parse = { it.parseRaw() },
+                )
+            }.getOrNull()
+            if (!listResp.isNullOrBlank()) {
+                val listJson = runCatching { JSONObject(listResp) }.getOrNull()
+                if (listJson != null) {
+                    chapters = parseChapters(
+                        listJson.optJSONArray("series_books")
+                            ?: listJson.optJSONArray("seriesBooks")
+                            ?: listJson.optJSONArray("content")
+                            ?: JSONArray(),
+                    )
+                }
+            }
         }
+
+        if (chapters.isEmpty()) {
+            val indexUrl = "$apiUrl/api/v2/series/$seriesId/books/index?fields=List"
+            val indexResp = runCatching {
+                executeWithCloudflareCheck(
+                    url = indexUrl,
+                    block = { webClient.httpGet(indexUrl, headers) },
+                    parse = { it.parseRaw() },
+                )
+            }.getOrNull()
+            if (!indexResp.isNullOrBlank()) {
+                val indexJson = runCatching { JSONObject(indexResp) }.getOrNull()
+                if (indexJson != null) {
+                    chapters = parseCompactChapterIndex(indexJson, seriesId)
+                }
+            }
+        }
+
+        val ratingRaw: Float? = run {
+            val raw = when {
+                json.has("average_rating") -> json.opt("average_rating")
+                json.has("averageRating") -> json.opt("averageRating")
+                else -> null
+            }
+            when (raw) {
+                null, JSONObject.NULL -> null
+                is Number -> raw.toFloat()
+                is String -> raw.toFloatOrNull()
+                else -> null
+            }
+        }
+        val rating = ratingRaw
+            ?.let { (it / 100f).coerceIn(0f, 1f) }
+            ?.takeIf { it > 0f }
+            ?: RATING_UNKNOWN
 
         return manga.copy(
             title = json.optString("title").ifBlank { manga.title },
@@ -523,6 +580,81 @@ internal class Kagane(context: MangaLoaderContext) :
             tags = genres,
             chapters = chapters,
             contentRating = parseContentRating(json.optString("content_rating")) ?: manga.contentRating,
+            rating = rating,
+        )
+    }
+
+    private fun parseCompactChapterIndex(json: JSONObject, seriesId: String): List<MangaChapter> {
+        val fieldsArr = json.optJSONArray("fields") ?: return emptyList()
+        val booksArr = json.optJSONArray("books") ?: return emptyList()
+        val groupsArr = json.optJSONArray("groups")
+
+        val fields = (0 until fieldsArr.length()).mapNotNull { i ->
+            (fieldsArr.opt(i) as? String)?.takeIf { it.isNotBlank() }
+        }
+        if (fields.size != fieldsArr.length()) return emptyList()
+
+        val groupTitles = if (groupsArr != null) {
+            (0 until groupsArr.length()).map { i ->
+                groupsArr.optJSONObject(i)?.optString("title") ?: ""
+            }
+        } else {
+            emptyList()
+        }
+
+        val chapters = ArrayList<MangaChapter>(booksArr.length())
+        for (i in 0 until booksArr.length()) {
+            val row = booksArr.optJSONArray(i) ?: continue
+            val valueMap = HashMap<String, Any?>(fields.size)
+            for (j in fields.indices) {
+                if (j >= row.length()) continue
+                val v = row.opt(j)
+                if (v == null || v == JSONObject.NULL) continue
+                valueMap[fields[j]] = v
+            }
+
+            val chId = (valueMap["book_id"] as? String)?.takeIf { it.isNotBlank() } ?: continue
+            val title = (valueMap["title"] as? String) ?: ""
+            val releasedAt = (valueMap["released_at"] as? Number)?.toLong()
+            val sortNo = (valueMap["sort_no"] as? Number)?.toFloat() ?: 0f
+            val chapterNo = (valueMap["chapter_no"] as? String)?.takeIf { it.isNotBlank() }
+            val volumeNo = (valueMap["volume_no"] as? String)?.takeIf { it.isNotBlank() }
+
+            val groupIx = (valueMap["group_ix"] as? JSONArray)?.let { arr ->
+                (0 until arr.length()).mapNotNull { idx ->
+                    arr.optInt(idx, -1).takeIf { it >= 0 }
+                }
+            } ?: emptyList()
+            val scanlators = groupIx
+                .mapNotNull { groupTitles.getOrNull(it) }
+                .filter { it.isNotBlank() }
+                .joinToString()
+
+            val number = chapterNo?.toFloatOrNull() ?: sortNo
+            val volume = volumeNo?.toIntOrNull() ?: 0
+            val chapterTitle = title.ifBlank {
+                chapterNo?.let { "Ch.$it" } ?: "Chapter $number"
+            }
+
+            chapters.add(
+                MangaChapter(
+                    id = generateUid("$seriesId:$chId"),
+                    title = chapterTitle,
+                    number = number,
+                    volume = volume,
+                    url = "/series/$seriesId/reader/$chId",
+                    uploadDate = releasedAt?.let { it * 1000L } ?: 0L,
+                    source = source,
+                    scanlator = scanlators.ifBlank { null },
+                    branch = null,
+                ),
+            )
+        }
+
+        return chapters.sortedWith(
+            compareBy<MangaChapter> { it.number }
+                .thenBy { it.volume }
+                .thenBy { it.title.orEmpty() },
         )
     }
 
@@ -796,7 +928,12 @@ internal class Kagane(context: MangaLoaderContext) :
         ) {
             response.close()
             val segments = url.pathSegments
-            val chapterId = segments.getOrNull(4)
+            /** /api/v2/books/page/[datasaver/]{chapterId}/{pageUuid}.{ext} */
+            val chapterId = if (segments.getOrNull(4) == "datasaver") {
+                segments.getOrNull(5)
+            } else {
+                segments.getOrNull(4)
+            }
             if (chapterId != null) {
                 runCatching { refreshAccessTokenBlocking(chapterId) }.onSuccess {
                     val retryRequest = newRequest.newBuilder()
@@ -816,69 +953,26 @@ internal class Kagane(context: MangaLoaderContext) :
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
         )
 
-        private val KAGANE_LANGS: Set<Locale> = setOf(
-            Locale("af"),
-            Locale("ar"),
-            Locale("az"),
-            Locale("be"),
-            Locale("bg"),
-            Locale("bn"),
-            Locale("ca"),
-            Locale("cs"),
-            Locale("cv"),
-            Locale("da"),
-            Locale.GERMAN,
-            Locale("el"),
-            Locale.ENGLISH,
-            Locale("eo"),
-            Locale("es"),
-            Locale("es","419"),
-            Locale("et"),
-            Locale("eu"),
-            Locale("fa"),
-            Locale("fi"),
-            Locale("fil"),
-            Locale.FRENCH,
-            Locale("ga"),
-            Locale("he"),
-            Locale("hi"),
-            Locale("hr"),
-            Locale("hu"),
-            Locale("id"),
-            Locale.ITALIAN,
-            Locale.JAPANESE,
-            Locale("jv"),
-            Locale("ka"),
-            Locale("kk"),
-            Locale.KOREAN,
-            Locale("la"),
-            Locale("lt"),
-            Locale("mn"),
-            Locale("ms"),
-            Locale("my"),
-            Locale("ne"),
-            Locale("nl"),
-            Locale("no"),
-            Locale("pl"),
-            Locale("pt"),
-            Locale("pt", "br"),
-            Locale("ro"),
-            Locale("ru"),
-            Locale("sk"),
-            Locale("sl"),
-            Locale("sq"),
-            Locale("sr"),
-            Locale("sv"),
-            Locale("ta"),
-            Locale("te"),
-            Locale("th"),
-            Locale("tr"),
-            Locale("uk"),
-            Locale("ur"),
-            Locale("uz"),
-            Locale("vi"),
-            Locale.SIMPLIFIED_CHINESE,
-            Locale.TRADITIONAL_CHINESE,
+        val KAGANE_LANGS = arrayOf(
+            "en",
+            "ja",
+            "ko",
+            "zh-Hans",
+            "zh-Hant",
+            "es",
+            "es-419",
+            "fr",
+            "de",
+            "pt",
+            "pt-BR",
+            "ru",
+            "it",
+            "id",
+            "vi",
+            "th",
+            "pl",
+            "hi",
+            "ar",
         )
 
         private fun JSONObject.optGenreId(): String = optString("genre_id").ifBlank { optString("id") }

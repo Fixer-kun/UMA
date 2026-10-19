@@ -245,21 +245,23 @@ internal class AstraManga(context: MangaLoaderContext) :
         val genresArray = obj.optJSONArray("genres")
         val tagsArray = obj.optJSONArray("tags")
         val allTags = mutableSetOf<MangaTag>()
+
         genresArray?.let { arr ->
             for (i in 0 until arr.length()) {
                 val genre = arr.getJSONObject(i)
                 val id = genre.getString("id")
                 val name = genre.getString("name")
-                allTags.add(MangaTag(id, name, source))
+                allTags.add(MangaTag(name, id, source))
             }
         }
+
         tagsArray?.let { arr ->
             for (i in 0 until arr.length()) {
                 val tag = arr.getJSONObject(i)
                 val id = tag.getString("id")
                 val name = tag.getString("name")
                 if (allTags.none { it.title == name }) {
-                    allTags.add(MangaTag(id, name, source))
+                    allTags.add(MangaTag(name, id, source))
                 }
             }
         }

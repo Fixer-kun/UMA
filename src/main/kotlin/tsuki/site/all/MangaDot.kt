@@ -25,10 +25,12 @@ import tsuki.util.generateUid
 import tsuki.util.parseJson
 import tsuki.util.parseJsonArray
 import tsuki.util.parseSafe
+import tsuki.util.await
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -36,8 +38,10 @@ import java.util.EnumSet
 import java.util.Locale
 import java.util.TimeZone
 
-@MangaSourceParser("MANGADOTNET", "Mangadot.net", type = ContentType.MANGA)
-internal class Mangadotnet(context: MangaLoaderContext) :
+// TODO: refractor and add future langauge support
+
+@MangaSourceParser("MANGADOTNET", "MangaDot")
+internal class MangaDot(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGADOTNET, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("mangadot.net")
@@ -55,21 +59,81 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         keys.add(showAdultKey)
     }
 
-    private fun decodeRsc(flat: JSONArray): Any? {
-        val cache = arrayOfNulls<Any>(flat.length())
+    private suspend fun fetchRscBody(url: String): String {
+        val request = Request.Builder()
+            .url(url)
+            .headers(getRequestHeaders())
+            .build()
+        return context.httpClient.newCall(request).await().use { response ->
+            response.body?.string().orEmpty()
+        }
+    }
+
+    private fun decodeRscBody(body: String): Any? {
+        val lines = body.split('\n').filter { it.isNotEmpty() }
+        if (lines.isEmpty()) return null
+
+        val flatJson = JSONArray(lines[0])
+        val flat = MutableList<Any?>(flatJson.length()) { flatJson.opt(it) }
+
+        val promises = mutableMapOf<Int, Int>()
+
+        for (i in 1 until lines.size) {
+            val line = lines[i]
+            val colon = line.indexOf(':')
+            if (colon <= 0) continue
+            val head = line.substring(0, colon)
+            val payload = line.substring(colon + 1)
+
+            val wrapped = runCatching { JSONArray("[$payload]").opt(0) }.getOrNull() ?: continue
+
+            val valueIndex: Int = when (wrapped) {
+                is JSONArray -> {
+                    val start = flat.size
+                    for (j in 0 until wrapped.length()) flat.add(wrapped.opt(j))
+                    start
+                }
+                is Number -> wrapped.toInt()
+                else -> continue
+            }
+
+            if (head[0] == 'P') {
+                head.drop(1).toIntOrNull()?.let { promises[it] = valueIndex }
+            }
+        }
+
+        val cache = arrayOfNulls<Any>(flat.size)
         val nil = Any()
+
         fun resolve(i: Int): Any? {
-            if (i < 0 || i >= flat.length()) return null
-            val cached = cache[i]
-            if (cached != null) return if (cached === nil) null else cached
-            val result: Any? = when (val el = flat.opt(i)) {
-                JSONObject.NULL -> null
+            if (i < 0 || i >= flat.size) return null
+            cache[i]?.let { return if (it === nil) null else it }
+
+            val result: Any? = when (val el = flat[i]) {
+                null, JSONObject.NULL -> null
                 is String, is Number, is Boolean -> el
-                is JSONArray -> (0 until el.length()).mapTo(mutableListOf()) { j -> resolve(el.optInt(j, -1)) }
+                is JSONArray -> {
+                    val first = el.opt(0)
+                    when {
+                        first is String && first == "P" -> {
+                            val pIdx = el.optInt(1, -1)
+                            promises[pIdx]?.let { resolve(it) }
+                        }
+                        first is String && first == "Z" -> resolve(el.optInt(1, -1))
+                        else -> {
+                            val out = ArrayList<Any?>(el.length())
+                            for (j in 0 until el.length()) out.add(resolve(el.optInt(j, -1)))
+                            out
+                        }
+                    }
+                }
                 is JSONObject -> {
-                    val map = mutableMapOf<String, Any?>()
+                    val map = LinkedHashMap<String, Any?>()
                     for (key in el.keys()) {
-                        val actualKey = if (key.startsWith("_")) flat.optString(key.removePrefix("_").toInt(), key) else key
+                        val actualKey = if (key.startsWith("_")) {
+                            val idx = key.removePrefix("_").toIntOrNull()
+                            (idx?.let { flat.getOrNull(it) as? String }) ?: key
+                        } else key
                         map[actualKey] = resolve(el.optInt(key, -1))
                     }
                     map
@@ -79,13 +143,14 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             cache[i] = result ?: nil
             return result
         }
+
         return resolve(0)
     }
 
     @Suppress("UNCHECKED_CAST")
     private suspend fun fetchRscRoute(url: String, route: String): Map<String, Any?> {
-        val flat = webClient.httpGet(url).parseJsonArray()
-        val decoded = decodeRsc(flat)
+        val body = fetchRscBody(url)
+        val decoded = decodeRscBody(body)
             ?: throw ParseException("Failed to decode RSC data", url)
         return (decoded as? Map<String, Any?>)?.get(route) as? Map<String, Any?>
             ?: throw ParseException("Missing RSC route '$route'", url)
@@ -107,35 +172,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         SortOrder.ADDED,
     )
 
-    companion object {
-        private val GENRES = setOf(
-            "Action", "Adventure", "Comedy", "Drama", "Fantasy",
-            "Historical", "Horror", "Mecha", "Mystery", "Psychological",
-            "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Thriller", "Tragedy",
-            "Cooking", "Demons", "Ecchi", "Harem", "Isekai", "Magic", "Martial Arts",
-            "Medical", "Military", "Music", "School Life", "Webtoon",
-            "Academy", "Acting", "Adult", "Aliens", "Animals", "Anthology", "Apocalypse",
-            "Avant Garde", "Award Winning", "BDSM", "Boys Love", "Bully", "Business",
-            "Child Abuse", "Child Neglect", "Comic", "Crime", "crossdressing", "Crossdressing",
-            "Cultivation", "Delinquents", "Difficult Childhood", "dojinshi", "Doujinshi",
-            "Erotica", "Female Protagonist", "Femdom", "Fight", "futanari on male", "futunari",
-            "Gender Bender", "Genderswap", "Ghosts", "Girls Love", "Gore", "Gourmet",
-            "Gyaru", "Hentai", "Hunters", "Idol", "Incest", "Loli", "Lolicon", "Mafia",
-            "Magical Girls", "Mahou Shoujo", "Manga", "Manhua", "Manhwa", "Mature",
-            "Medieval Area", "Monster Girls", "Monsters", "Ninja", "Nobility",
-            "Office Romance", "Office Worker", "Office Workers", "One Shot", "Otome",
-            "Overpowered", "Philosophical", "playboy", "Police", "Post-Apocalyptic",
-            "Reincarnation", "Revenge", "Reverse Harem", "Royalty", "Samurai", "School",
-            "Seinin", "Shota", "Shotacon", "Shoujo Ai", "Shounen Ai", "Smut", "Superhero",
-            "Survival", "Suspense", "System", "Time Travel", "Traditional Games", "uncensored",
-            "Vampires", "Video Games", "Villainess", "Virtual Reality", "War", "Workplace",
-            "Wuxia", "Yaoi", "Yuri", "Zombies"
-        )
-    }
-
-    private val availableTags = GENRES
-        .map { MangaTag(it, it, source) }
-        .toSet()
+    private val availableTags = GENRES.map { MangaTag(it, it, source) }.toSet()
 
     override suspend fun getFilterOptions(): MangaListFilterOptions {
         return MangaListFilterOptions(
@@ -169,6 +206,26 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         )
     }
 
+    private fun shouldHideAdultCovers(): Boolean = !config[showAdultKey]
+
+    private fun isBlurworthy(v: Any?): Boolean = when (v) {
+        is Number -> v.toInt() == 1
+        is Boolean -> v
+        is String -> v == "1" || v.equals("true", ignoreCase = true)
+        else -> false
+    }
+
+    private fun resolvePhotoUrl(photo: String?): String? =
+        photo?.takeIf { it.isNotBlank() }?.let {
+            when {
+                it.startsWith("/") -> "$baseUrl$it"
+                it.startsWith("http") -> it
+                else -> null
+            }
+        }
+
+    private var selectedLanguage: String? = null
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         selectedLanguage = filter.locale?.let { localeToLang(it) } ?: "en"
         return getSearchPage(page, order, filter)
@@ -181,6 +238,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             addQueryParameter("page", page.toString())
             addQueryParameter("adult", adultParam)
             selectedLanguage?.let { addQueryParameter("lang", it) }
+
             val (sortBy, sortOrder) = when (order) {
                 SortOrder.UPDATED -> "latest" to "desc"
                 SortOrder.ALPHABETICAL -> "alphabetical" to "asc"
@@ -193,9 +251,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             addQueryParameter("sortBy", sortBy)
             addQueryParameter("sortOrder", sortOrder)
 
-            if (filter.states.size == 1) {
-                addQueryParameter("status", filter.states.first().toApiStatus())
-            }
+            if (filter.states.size == 1) addQueryParameter("status", filter.states.first().toApiStatus())
 
             filter.types.forEach { ct ->
                 when (ct) {
@@ -211,14 +267,8 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             filter.demographics.forEach { demographic ->
                 addQueryParameter("genres", demographic.name.lowercase().replaceFirstChar { it.uppercase() })
             }
-
-            filter.tags.forEach { tag ->
-                addQueryParameter("genres", tag.key)
-            }
-
-            filter.tagsExclude.forEach { tag ->
-                addQueryParameter("excludeGenres", tag.key)
-            }
+            filter.tags.forEach { addQueryParameter("genres", it.key) }
+            filter.tagsExclude.forEach { addQueryParameter("excludeGenres", it.key) }
         }.build().toString()
 
         val json = webClient.httpGet(url).parseJson()
@@ -226,22 +276,21 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             ?: json.optJSONArray("results")
             ?: throw ParseException("Missing manga list in search response", url)
 
-        return (0 until items.length()).map { i ->
-            parseMangaFromList(items.getJSONObject(i))
-        }
+        return (0 until items.length()).map { i -> parseMangaFromList(items.getJSONObject(i)) }
     }
 
     private fun parseMangaFromList(data: JSONObject): Manga {
-        val id = (data.optInt("id", data.optInt("manga_id", 0))).takeIf { it > 0 }?.toString() ?: ""
+        val id = data.optInt("id", data.optInt("manga_id", 0)).takeIf { it > 0 }?.toString() ?: ""
         val title = data.optString("title")
         val photo = data.optString("photo")
-        val coverUrl = photo?.takeIf { it.isNotBlank() }?.let {
-            when {
-                it.startsWith("/") -> "$baseUrl$it"
-                it.startsWith("http") -> it
-                else -> null
-            }
+        val blurworthy = isBlurworthy(data.opt("is_blurworthy"))
+
+        val coverUrl = if (blurworthy && shouldHideAdultCovers()) {
+            NSFW_PLACEHOLDER
+        } else {
+            resolvePhotoUrl(photo)
         }
+
         return Manga(
             id = generateUid(id),
             url = id,
@@ -258,14 +307,11 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         )
     }
 
-    private var selectedLanguage: String? = null
-    private fun localeToLang(locale: Locale): String {
-        return when (locale.language) {
-            "pt" if locale.country == "BR" -> "pt-br"
-            "es" if locale.country == "419" -> "es-la"
-            "zh" if locale.country == "Hant" -> "zh-hk"
-            else -> locale.language
-        }
+    private fun localeToLang(locale: Locale): String = when (locale.language) {
+        "pt" if locale.country == "BR" -> "pt-br"
+        "es" if locale.country == "419" -> "es-la"
+        "zh" if locale.country == "Hant" -> "zh-hk"
+        else -> locale.language
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
@@ -273,30 +319,20 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         val routeValue = fetchRscRoute(url, "pages/MangaDetailPage")
 
         val mangaInfo = routeValue
-            .asMap("data")
-            ?.asMap("mangaData")
-            ?.asMap("manga")
+            .asMap("data")?.asMap("mangaData")?.asMap("manga")
             ?: throw ParseException("Missing manga data in detail route", url)
 
         val title = mangaInfo["title"] as? String ?: manga.title
         val description = mangaInfo["description"] as? String
-        val photo = mangaInfo["photo"] as? String
-        val coverUrl = photo?.let {
-            when {
-                it.startsWith("/") -> "$baseUrl$it"
-                it.startsWith("http") -> it
-                else -> null
-            }
-        } ?: manga.coverUrl
 
-        val bannerImage = mangaInfo["banner_image"] as? String
-        val largeCoverUrl = bannerImage?.let {
-            when {
-                it.startsWith("/") -> "$baseUrl$it"
-                it.startsWith("http") -> it
-                else -> null
-            }
+        val blurworthy = isBlurworthy(mangaInfo["is_blurworthy"])
+        val coverUrl = if (blurworthy && shouldHideAdultCovers()) {
+            NSFW_PLACEHOLDER
+        } else {
+            resolvePhotoUrl(mangaInfo["photo"] as? String) ?: manga.coverUrl
         }
+
+        val largeCoverUrl = resolvePhotoUrl(mangaInfo["banner_image"] as? String)
 
         val genres = (mangaInfo["genres"] as? List<*>)
             ?.filterIsInstance<String>()
@@ -310,7 +346,6 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             .orEmpty()
 
         val origin = mangaInfo["country_of_origin"] as? String
-
         val authorRaw = mangaInfo["authors"] as? String
         val author = parseJsonArrayString(authorRaw)?.joinToString(", ") ?: authorRaw
 
@@ -345,9 +380,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
         val rating = if (rawRating >= 0.0) (rawRating / 10.0).toFloat() else RATING_UNKNOWN
 
         val chapterLang = selectedLanguage ?: "en"
-        val chaptersDeferred = async {
-            fetchChaptersAndVolumes(manga.url, chapterLang)
-        }
+        val chaptersDeferred = async { fetchChaptersAndVolumes(manga.url, chapterLang) }
 
         manga.copy(
             title = title,
@@ -374,7 +407,6 @@ internal class Mangadotnet(context: MangaLoaderContext) :
     private suspend fun fetchChaptersAndVolumes(mangaId: String, lang: String): List<MangaChapter> = coroutineScope {
         val chaptersDeferred = async { fetchChaptersFromApi(mangaId, lang) }
         val volumesDeferred = async { fetchVolumesFromApi(mangaId, lang) }
-
         val chapters = chaptersDeferred.await()
         val volumes = volumesDeferred.await()
         val builder = ChaptersListBuilder(chapters.size + volumes.size)
@@ -392,8 +424,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
             val team = listOf(
                 ch.optString("group_name", ""),
                 ch.optString("scanlator_name", "")
-            ).firstOrNull { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
-                ?: "Unknown"
+            ).firstOrNull { it.isNotBlank() && !it.equals("null", ignoreCase = true) } ?: "Unknown"
             chaptersByTeam.getOrPut(team) { mutableListOf() }.add(ch)
         }
 
@@ -412,9 +443,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
                     val numStr = num.toString().removeSuffix(".0")
                     append("Chapter $numStr")
                     val cleanName = name?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
-                    if (cleanName != null && !cleanName.contains(numStr)) {
-                        append(": ").append(cleanName)
-                    }
+                    if (cleanName != null && !cleanName.contains(numStr)) append(": ").append(cleanName)
                 }
                 val chapterUrl = JSONObject().apply {
                     put("id", chId)
@@ -476,8 +505,8 @@ internal class Mangadotnet(context: MangaLoaderContext) :
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterData = JSONObject(chapter.url)
         val chapterId = chapterData.getString("id")
-        val source = chapterData.optString("source", "user")
-        val segment = if (source == "user") "uploads" else "chapters"
+        val src = chapterData.optString("source", "user")
+        val segment = if (src == "user") "uploads" else "chapters"
         val response = webClient.httpGet("$baseUrl/api/$segment/$chapterId/images").parseJson()
         val data = response.optJSONObject("data")
         val imagesArray = if (data != null && data.has("images")) data.getJSONArray("images") else response.getJSONArray("images")
@@ -489,12 +518,7 @@ internal class Mangadotnet(context: MangaLoaderContext) :
                 imgUrl.startsWith("http") -> imgUrl
                 else -> return@mapNotNull null
             }
-            MangaPage(
-                id = generateUid(fullUrl),
-                url = fullUrl,
-                preview = null,
-                source = this.source,
-            )
+            MangaPage(id = generateUid(fullUrl), url = fullUrl, preview = null, source = this.source)
         }
     }
 
@@ -530,4 +554,32 @@ internal class Mangadotnet(context: MangaLoaderContext) :
     @Suppress("UNCHECKED_CAST")
     private fun Map<String, Any?>.asMap(key: String): Map<String, Any?>? = this[key] as? Map<String, Any?>
     private fun String?.nullIfEmpty(): String? = if (this.isNullOrEmpty()) null else this
+
+    companion object {
+        private val GENRES = setOf(
+            "Action", "Adventure", "Comedy", "Drama", "Fantasy",
+            "Historical", "Horror", "Mecha", "Mystery", "Psychological",
+            "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Thriller", "Tragedy",
+            "Cooking", "Demons", "Ecchi", "Harem", "Isekai", "Magic", "Martial Arts",
+            "Medical", "Military", "Music", "School Life", "Webtoon",
+            "Academy", "Acting", "Adult", "Aliens", "Animals", "Anthology", "Apocalypse",
+            "Avant Garde", "Award Winning", "BDSM", "Boys Love", "Bully", "Business",
+            "Child Abuse", "Child Neglect", "Comic", "Crime", "crossdressing", "Crossdressing",
+            "Cultivation", "Delinquents", "Difficult Childhood", "dojinshi", "Doujinshi",
+            "Erotica", "Female Protagonist", "Femdom", "Fight", "futanari on male", "futunari",
+            "Gender Bender", "Genderswap", "Ghosts", "Girls Love", "Gore", "Gourmet",
+            "Gyaru", "Hentai", "Hunters", "Idol", "Incest", "Loli", "Lolicon", "Mafia",
+            "Magical Girls", "Mahou Shoujo", "Manga", "Manhua", "Manhwa", "Mature",
+            "Medieval Area", "Monster Girls", "Monsters", "Ninja", "Nobility",
+            "Office Romance", "Office Worker", "Office Workers", "One Shot", "Otome",
+            "Overpowered", "Philosophical", "playboy", "Police", "Post-Apocalyptic",
+            "Reincarnation", "Revenge", "Reverse Harem", "Royalty", "Samurai", "School",
+            "Seinin", "Shota", "Shotacon", "Shoujo Ai", "Shounen Ai", "Smut", "Superhero",
+            "Survival", "Suspense", "System", "Time Travel", "Traditional Games", "uncensored",
+            "Vampires", "Video Games", "Villainess", "Virtual Reality", "War", "Workplace",
+            "Wuxia", "Yaoi", "Yuri", "Zombies"
+        )
+
+        private const val NSFW_PLACEHOLDER = "https://fakeimg.cnbattle.com/400x600/?text=NSFW"
+    }
 }

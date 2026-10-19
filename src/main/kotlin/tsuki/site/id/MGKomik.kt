@@ -13,10 +13,15 @@ import tsuki.model.MangaTag
 import tsuki.model.SortOrder
 
 import tsuki.util.parseHtml
+import tsuki.util.toAbsoluteUrl
 
 import okhttp3.Interceptor
 import androidx.collection.arraySetOf
 import okhttp3.Response
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
 
 @MangaSourceParser("MGKOMIK", "MGKomik", "id")
 internal class MGKomik(context: MangaLoaderContext) :
@@ -25,18 +30,23 @@ internal class MGKomik(context: MangaLoaderContext) :
     override val datePattern = "dd MMM yy"
     override val tagPrefix = "genres/"
     override val selectDesc = "div.description-summary div.summary__content p"
-
     override val withoutAjax = true
-
+    
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val path = request.url.encodedPath
-        val isAjax = path.contains("admin-ajax.php") ||
-                path.contains("wp-json") ||
-                path.endsWith("/ajax/chapters")
+        val url = request.url
+        val path = url.encodedPath
+        val isSameHost = url.host.equals(domain, ignoreCase = true)
+        val isAjax = isSameHost && (
+                path.contains("admin-ajax.php") ||
+                        path.contains("wp-json") ||
+                        path.endsWith("/ajax/chapters")
+                )
 
         val builder = request.newBuilder()
             .header("Sec-CH-UA-Model", "\"\"")
+            .header("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Referer", "https://$domain/")
 
         if (isAjax) {
             builder.header("X-Requested-With", "XMLHttpRequest")
@@ -47,6 +57,15 @@ internal class MGKomik(context: MangaLoaderContext) :
                 .header("Priority", "u=1, i")
                 .removeHeader("Sec-Fetch-User")
                 .removeHeader("Upgrade-Insecure-Requests")
+        } else if (isSameHost) {
+            builder.header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                )
         }
 
         return chain.proceed(builder.build())
@@ -73,11 +92,68 @@ internal class MGKomik(context: MangaLoaderContext) :
     override suspend fun fetchAvailableTags(): Set<MangaTag> {
         return super.fetchAvailableTags()
     }
-    
+
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = availableTags(),
     )
-    
+
+    override suspend fun getDetails(manga: Manga): Manga {
+        val details = super.getDetails(manga)
+
+        val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+
+        val dateByUrl: Map<String, Long> = doc.select("li.wp-manga-chapter").mapNotNull { li ->
+            val href = li.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+            val rawDate = li.selectFirst("span.chapter-release-date i")
+                ?.text()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+            val parsed = parseAnyDate(rawDate)
+            if (parsed > 0L) href to parsed else null
+        }.toMap()
+
+        if (dateByUrl.isEmpty()) return details
+
+        return details.copy(
+            chapters = details.chapters?.map { ch ->
+                val fixed = dateByUrl[ch.url]
+                if (fixed != null && fixed > 0L) ch.copy(uploadDate = fixed) else ch
+            },
+        )
+    }
+
+    private fun parseAnyDate(text: String): Long {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return 0L
+        val lower = trimmed.lowercase()
+
+        if (lower.contains("ago")) {
+            val num = Regex("""(\d+)""").find(lower)?.groupValues?.get(1)?.toIntOrNull()
+                ?: return 0L
+            val cal = Calendar.getInstance()
+            when {
+                lower.contains("second") -> cal.add(Calendar.SECOND, -num)
+                lower.contains("minute") -> cal.add(Calendar.MINUTE, -num)
+                lower.contains("hour")   -> cal.add(Calendar.HOUR_OF_DAY, -num)
+                lower.contains("day")    -> cal.add(Calendar.DAY_OF_MONTH, -num)
+                lower.contains("week")   -> cal.add(Calendar.DAY_OF_MONTH, -num * 7)
+                lower.contains("month")  -> cal.add(Calendar.MONTH, -num)
+                lower.contains("year")   -> cal.add(Calendar.YEAR, -num)
+                else -> return 0L
+            }
+            return cal.timeInMillis
+        }
+
+        return try {
+            SimpleDateFormat(datePattern, Locale.ENGLISH).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.parse(trimmed)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
     private fun availableTags() = arraySetOf(
         MangaTag("2 hours ago", "2-hours-ago", source),
         MangaTag("7 hours ago", "7-hours-ago", source),
@@ -172,5 +248,4 @@ internal class MGKomik(context: MangaLoaderContext) :
         MangaTag("Wuxia", "wuxia", source),
         MangaTag("Yuri", "yuri", source),
     )
-
 }

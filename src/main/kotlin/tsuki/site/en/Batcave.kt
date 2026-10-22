@@ -40,7 +40,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
-import org.json.JSONTokener
 import org.jsoup.HttpStatusException
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -48,6 +47,7 @@ import org.jsoup.nodes.Document
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -156,24 +156,23 @@ internal class Batcave(context: MangaLoaderContext) :
 
     private suspend fun loadDocumentViaWebView(url: String): Document? {
         val script = """
-            (function() {
-                try {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', ${JSONObject.quote(url)}, false);
-                    xhr.send();
-                    if (xhr.status >= 200 && xhr.status < 400) {
-                        return xhr.responseText;
-                    }
-                    return "ERROR:HTTP_" + xhr.status;
-                } catch (e) {
-                    return "ERROR:" + (e && e.message ? e.message : String(e));
+        (() => {
+            return new Promise(resolve => {
+                const finish = () => {
+                    resolve(document.documentElement ? document.documentElement.outerHTML : "");
+                };
+                if (document.readyState === "complete") {
+                    setTimeout(finish, 200);
+                } else {
+                    window.addEventListener("load", () => setTimeout(finish, 200), { once: true });
                 }
-            })();
-        """.trimIndent()
+                setTimeout(finish, 3000);
+            });
+        })();
+    """.trimIndent()
 
-        val raw = context.evaluateJs(url, script) ?: return null
-        val html = raw.decodeJsString() ?: return null
-        if (html.startsWith("ERROR:") || html.isBlank()) return null
+        val html = withTimeoutOrNull(10_000L.milliseconds) { context.evaluateJs(url, script) } ?: return null
+        if (html.isBlank()) return null
 
         val doc = Jsoup.parse(html, url)
         if (hasValidBatCaveContent(doc)) return doc
@@ -182,16 +181,34 @@ internal class Batcave(context: MangaLoaderContext) :
         return doc
     }
 
-    private fun String.decodeJsString(): String? {
-        if (this == "null") return null
-        return runCatching { JSONTokener(this).nextValue() as? String }.getOrNull()
+    private suspend fun solveDleGuardInWebView(url: String): Boolean {
+        val script = """
+        (() => new Promise(resolve => {
+            const started = Date.now();
+            const check = () => {
+                if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
+                    resolve("ok");
+                } else if (Date.now() - started > 25000) {
+                    resolve("timeout");
+                } else {
+                    setTimeout(check, 250);
+                }
+            };
+            check();
+        }))();
+    """.trimIndent()
+        runCatchingCancellable {
+            withTimeoutOrNull(30_000L.milliseconds) { context.evaluateJs(url, script) }
+        }
+        return hasDleGuardTrust()
     }
 
     private suspend fun solveDleGuard(url: String): Boolean = dleGuardMutex.withLock {
         if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
             return@withLock true
         }
-        val solved = runCatchingCancellable { solveDleGuardChallenge(url) }.getOrDefault(false)
+        val solved = runCatchingCancellable { solveDleGuardChallenge(url) }.getOrDefault(false) ||
+                solveDleGuardInWebView(url)
         if (solved) {
             lastGuardSolveAt = System.currentTimeMillis()
         }

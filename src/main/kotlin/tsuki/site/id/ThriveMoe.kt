@@ -92,7 +92,7 @@ internal class ThriveMoe(context: MangaLoaderContext) :
                 .mapNotNull(::parseMangaCard)
                 .distinctBy { it.url }
         }
-        
+
         if (!filter.query.isNullOrBlank()) {
             val url = siteUrl.toHttpUrl().newBuilder().apply {
                 addPathSegment("search")
@@ -151,7 +151,7 @@ internal class ThriveMoe(context: MangaLoaderContext) :
             source = source,
         )
     }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val mangaId = manga.url.substringAfterLast('/')
         if (mangaId.isBlank()) return manga
@@ -233,7 +233,7 @@ internal class ThriveMoe(context: MangaLoaderContext) :
         }
 
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT)
-        val chapters = mutableListOf<MangaChapter>()
+        val rawChapters = mutableListOf<MangaChapter>()
         props.optJSONArray("chapterlist")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val ch = arr.optJSONObject(i) ?: continue
@@ -255,7 +255,7 @@ internal class ThriveMoe(context: MangaLoaderContext) :
                 val displayName = chapterTitle?.let { "Chapter $number - $it" }
                     ?: "Chapter $number"
 
-                chapters.add(
+                rawChapters.add(
                     MangaChapter(
                         id = generateUid(chapterId),
                         title = displayName,
@@ -270,6 +270,22 @@ internal class ThriveMoe(context: MangaLoaderContext) :
                 )
             }
         }
+        
+        val chaptersByNumber = rawChapters.groupBy { it.number }
+        val chapters = rawChapters.map { chapter ->
+            val group = chaptersByNumber[chapter.number].orEmpty()
+            if (group.size <= 1) {
+                chapter
+            } else {
+                val primaryId = group.maxByOrNull { it.uploadDate }?.id
+                if (chapter.id == primaryId) {
+                    chapter
+                } else {
+                    val branchName = chapter.scanlator?.takeIf { it.isNotBlank() } ?: "Unknown"
+                    chapter.copy(branch = branchName)
+                }
+            }
+        }.sortedBy { it.number }
 
         return base.copy(
             title = title,
@@ -281,14 +297,14 @@ internal class ThriveMoe(context: MangaLoaderContext) :
             tags = tags,
             state = state,
             contentRating = contentRating,
-            chapters = chapters.sortedBy { it.number },
+            chapters = chapters,
         )
     }
 
     private fun cdnCoverUrl(raw: String, size: Int): String =
         raw.replace("uploads.mangadex.org", "cdn.thrive.moe")
             .let { "$it.$size.jpg" }
-    
+
     override suspend fun resolveLink(link: HttpUrl): Manga? {
         if (link.host != domain) return null
         val segments = link.pathSegments.filter { it.isNotBlank() }
@@ -328,7 +344,7 @@ internal class ThriveMoe(context: MangaLoaderContext) :
 
         return fetchDetails(mangaId, stubManga(mangaId))
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast('/')
         if (chapterId.isBlank()) return emptyList()

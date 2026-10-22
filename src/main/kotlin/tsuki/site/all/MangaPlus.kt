@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package tsuki.site.all
 
 import tsuki.MangaLoaderContext
@@ -13,549 +15,200 @@ import tsuki.model.MangaListFilterOptions
 import tsuki.model.MangaPage
 import tsuki.model.MangaParserSource
 import tsuki.model.MangaState
+import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
 
+import tsuki.util.parseAsProto
 import tsuki.util.generateUid
 import tsuki.util.toAbsoluteUrl
-import tsuki.util.toTitleCase
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.protobuf.ProtoNumber
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import okio.Buffer
-import okio.IOException
+import java.io.IOException
 import java.util.EnumSet
 import java.util.UUID
 import java.util.concurrent.Semaphore
 
-// created very small protobuf reader via Okio
-@Throws(IOException::class)
-private fun Buffer.readProtobufVarint(): Long {
-    var result = 0L
-    var shift = 0
-    while (true) {
-        val b = readByte().toInt() and 0xFF
-        result = result or ((b and 0x7F).toLong() shl shift)
-        if (b and 0x80 == 0) break
-        shift += 7
-        if (shift > 63) throw IOException("Malformed varint")
+@Serializable
+data class MangaPlusResponse(
+    @ProtoNumber(1) val success: SuccessResult? = null,
+    @ProtoNumber(2) val error: ErrorResult? = null,
+)
+
+@Serializable
+data class ErrorResult(
+    @ProtoNumber(2) val englishPopup: Popup? = null,
+    @ProtoNumber(3) val spanishPopup: Popup? = null,
+) {
+    fun langPopup(langCode: Int): Popup? = when (langCode) {
+        LANGUAGE_SPANISH -> spanishPopup ?: englishPopup
+        else -> englishPopup
     }
-    return result
 }
 
-@Throws(IOException::class)
-private fun Buffer.readProtobufString(): String = readByteArray(readProtobufVarint()).toString(Charsets.UTF_8)
+@Serializable
+data class Popup(
+    @ProtoNumber(1) val subject: String = "",
+    @ProtoNumber(2) val body: String = "",
+)
 
-@Throws(IOException::class)
-private fun Buffer.readProtobufBytes(): ByteArray = readByteArray(readProtobufVarint())
-
-data class MPResponse(val success: SuccessResult?, val error: String?)
-
+@Serializable
 data class SuccessResult(
-    val titleRankingView: TitleRankingView?,
-    val webHomeView: WebHomeView?,
-    val allTitlesView: AllTitlesView?,
-    val titleDetailView: TitleDetailView?,
-    val mangaViewer: MangaViewer?
+    @ProtoNumber(8) val titleDetailView: TitleDetailView? = null,
+    @ProtoNumber(10) val mangaViewer: MangaViewer? = null,
+    @ProtoNumber(25) val allTitlesView: AllTitlesView? = null,
+    @ProtoNumber(35) val allTitlesViewV3: AllTitlesViewV3? = null,
+    @ProtoNumber(37) val titleRankingView: TitleRankingView? = null,
+    @ProtoNumber(38) val webHomeView: WebHomeView? = null,
 )
 
-data class TitleRankingView(val rankedTitles: List<RankedTitle>)
-data class RankedTitle(val titles: List<Title>)
-data class WebHomeView(val groups: List<UpdatedTitleGroup>)
-data class UpdatedTitleGroup(val titles: List<UpdatedTitle>)
-data class UpdatedTitle(val title: Title?)   // can be null
+@Serializable
+data class AllTitlesViewV3(
+    @ProtoNumber(2) val tags: List<TagName> = emptyList(),
+    @ProtoNumber(3) val titles: List<AllTitlesV3Entry> = emptyList(),
+)
 
-data class AllTitlesView(val allTitlesGroup: List<AllTitlesGroup>)
-data class AllTitlesGroup(val titles: List<Title>)
+@Serializable
+data class AllTitlesV3Entry(
+    @ProtoNumber(2) val title: Title,
+    @ProtoNumber(3) val genres: List<TagName> = emptyList(),
+)
 
+@Serializable
+data class TitleRankingView(
+    @ProtoNumber(3) val rankedTitles: List<RankedTitle> = emptyList(),
+)
+
+@Serializable
+data class RankedTitle(
+    @ProtoNumber(2) val titles: List<Title> = emptyList(),
+)
+
+@Serializable
+data class AllTitlesView(
+    @ProtoNumber(1) val allTitlesGroup: List<AllTitlesGroup> = emptyList(),
+)
+
+@Serializable
+data class AllTitlesGroup(
+    @ProtoNumber(2) val titles: List<Title> = emptyList(),
+)
+
+@Serializable
+data class WebHomeView(
+    @ProtoNumber(2) val groups: List<UpdatedTitleGroup> = emptyList(),
+    @ProtoNumber(7) val featured: FeaturedUpdate? = null,
+)
+
+@Serializable
+data class FeaturedUpdate(
+    @ProtoNumber(2) val title: UpdatedTitle,
+)
+
+@Serializable
+data class UpdatedTitleGroup(
+    @ProtoNumber(2) val titles: List<UpdatedTitle> = emptyList(),
+)
+
+@Serializable
+data class UpdatedTitle(
+    @ProtoNumber(3) val latestChapters: List<LatestChapter> = emptyList(),
+    @ProtoNumber(6) val updatedAt: Int = 0,
+)
+
+@Serializable
+data class LatestChapter(
+    @ProtoNumber(1) val title: Title,
+)
+
+@Serializable
 data class Title(
-    val titleId: Int,
-    val name: String,
-    val author: String?,
-    val portraitImageUrl: String,
-    val language: Int
+    @ProtoNumber(1) val titleId: Int = 0,
+    @ProtoNumber(2) val name: String = "",
+    @ProtoNumber(3) val author: String? = null,
+    @ProtoNumber(4) val portraitImageUrl: String = "",
+    @ProtoNumber(7) val language: Int = LANGUAGE_ENGLISH,
 )
 
+@Serializable
 data class TitleDetailView(
-    val title: Title,
-    val overview: String,
-    val viewingPeriodDescription: String,
-    val nonAppearanceInfo: String,
-    val chapterListGroup: List<ChapterListGroup>
+    @ProtoNumber(1) val title: Title,
+    @ProtoNumber(3) val overview: String = "",
+    @ProtoNumber(7) val viewingPeriodDescription: String = "",
+    @ProtoNumber(8) val nonAppearanceInfo: String = "",
+    @ProtoNumber(28) val chapterListGroup: List<ChapterListGroup> = emptyList(),
+    @ProtoNumber(31) val genreList: List<TagName> = emptyList(),
+) {
+    val chapterList: List<Chapter>
+        get() = chapterListGroup.flatMap { it.firstChapterList + it.lastChapterList }
+}
+
+@Serializable
+data class TagName(
+    @ProtoNumber(1) val name: String = "",
+    @ProtoNumber(2) val slug: String = "",
 )
 
+@Serializable
 data class ChapterListGroup(
-    val firstChapterList: List<Chapter>,
-    val lastChapterList: List<Chapter>
+    @ProtoNumber(2) val firstChapterList: List<Chapter> = emptyList(),
+    @ProtoNumber(4) val lastChapterList: List<Chapter> = emptyList(),
 )
 
+@Serializable
 data class Chapter(
-    val chapterId: Int,
-    val name: String,
-    val subTitle: String?,
-    val startTimeStamp: Int
-)
+    @ProtoNumber(2) val chapterId: Int,
+    @ProtoNumber(3) val name: String,
+    @ProtoNumber(4) val subTitle: String? = null,
+    @ProtoNumber(6) val startTimeStamp: Int = 0,
+) {
+    val isExpired: Boolean get() = subTitle == null
+}
 
+@Serializable
 data class MangaViewer(
-    val pages: List<MangaPlusPage>,
-    val titleId: Int?,
-    val viewToken: String?
+    @ProtoNumber(1) val pages: List<MangaPlusPage> = emptyList(),
+    @ProtoNumber(9) val titleId: Int? = null,
+    @ProtoNumber(19) val viewToken: String? = null,
 )
 
-data class MangaPlusPage(val mangaPage: MPImagePage?)
-data class MPImagePage(val imageUrl: String, val encryptionKey: String?)
+@Serializable
+data class MangaPlusPage(
+    @ProtoNumber(1) val mangaPage: MPImagePage? = null,
+)
 
-// field numbers
-private const val FIELD_SUCCESS = 1
-private const val FIELD_ERROR   = 2
+@Serializable
+data class MPImagePage(
+    @ProtoNumber(1) val imageUrl: String = "",
+    @ProtoNumber(5) val encryptionKey: String? = null,
+)
 
-// SuccessResult sub‑fields
-private const val FIELD_TITLE_DETAIL_VIEW = 8
-private const val FIELD_MANGA_VIEWER      = 10
-private const val FIELD_ALL_TITLES_VIEW   = 25
-private const val FIELD_TITLE_RANKING_VIEW= 37
-private const val FIELD_WEB_HOME_VIEW     = 38
-
-// TitleDetailView fields
-private const val FIELD_TITLE        = 1
-private const val FIELD_OVERVIEW     = 3
-private const val FIELD_VIEWING_PERIOD = 7
-private const val FIELD_NON_APPEARANCE = 8
-private const val FIELD_CHAPTER_LIST_GROUP = 28
-
-// Title fields
-private const val FIELD_TITLE_ID    = 1
-private const val FIELD_TITLE_NAME  = 2
-private const val FIELD_AUTHOR      = 3
-private const val FIELD_PORTRAIT_IMAGE = 4
-private const val FIELD_LANGUAGE     = 7
-
-// ChapterListGroup fields
-private const val FIELD_FIRST_CHAPTER_LIST = 2
-private const val FIELD_LAST_CHAPTER_LIST  = 4
-
-// Chapter fields
-private const val FIELD_CHAPTER_ID      = 2
-private const val FIELD_CHAPTER_NAME    = 3
-private const val FIELD_SUBTITLE        = 4
-private const val FIELD_START_TIMESTAMP = 6
-
-// MangaViewer fields
-private const val FIELD_PAGES     = 1
-private const val FIELD_TITLE_ID_MV = 9
-private const val FIELD_VIEW_TOKEN = 19
-
-// MangaPlusPage fields
-private const val FIELD_MANGA_PAGE = 1
-
-// MangaPage fields
-private const val FIELD_IMAGE_URL       = 1
-private const val FIELD_ENCRYPTION_KEY  = 5
-
-// TitleRankingView fields
-private const val FIELD_RANKED_TITLES = 3
-// RankedTitle fields
-private const val FIELD_RANKED_TITLE_TITLES = 2
-
-// WebHomeView fields
-private const val FIELD_GROUPS = 2
-// UpdatedTitleGroup fields
-private const val FIELD_GROUP_TITLES = 2
-// UpdatedTitle fields
-private const val FIELD_LATEST_CHAPTER = 3
-// LatestChapter fields
-private const val FIELD_LATEST_CHAPTER_TITLE = 1
-
-// AllTitlesView fields
-private const val FIELD_ALL_TITLES_GROUP = 1
-// AllTitlesGroup fields
-private const val FIELD_GROUP_TITLES_ALL = 2
-
-
-private const val one = "low"
-private const val two = "high"
-private const val three = "super_high"
-
-@Throws(IOException::class)
-private fun Buffer.parseMPResponse(): MPResponse {
-    var success: SuccessResult? = null
-    var error: String? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fieldNumber = (tag shr 3).toInt()
-        val wireType = (tag and 0x07).toInt()
-        when (fieldNumber) {
-            FIELD_SUCCESS -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    success = Buffer().apply { write(bytes) }.parseSuccessResult()
-                } else skipField(wireType)
-            }
-            FIELD_ERROR -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    // parse simple error message (first string body)
-                    val buf = Buffer().apply { write(bytes) }
-                    while (!buf.exhausted()) {
-                        val t = buf.readProtobufVarint()
-                        val fn = (t shr 3).toInt()
-                        val wt = (t and 0x07).toInt()
-                        if (fn == 2 && wt == 2) {
-                            val nested = buf.readProtobufBytes()
-                            val nestedBuf = Buffer().apply { write(nested) }
-                            // Try to extract body field
-                            while (!nestedBuf.exhausted()) {
-                                val nt = nestedBuf.readProtobufVarint()
-                                val nfn = (nt shr 3).toInt()
-                                val nwt = (nt and 0x07).toInt()
-                                if (nfn == 2 && nwt == 2) {
-                                    error = nestedBuf.readProtobufString()
-                                    break
-                                } else nestedBuf.skipField(nwt)
-                            }
-                        } else buf.skipField(wt)
-                    }
-                } else skipField(wireType)
-            }
-            else -> skipField(wireType)
-        }
-    }
-    return MPResponse(success, error)
-}
-
-@Throws(IOException::class)
-private fun Buffer.skipField(wireType: Int) {
-    when (wireType) {
-        0 -> readProtobufVarint()
-        1 -> skip(8)
-        2 -> skip(readProtobufVarint())
-        5 -> skip(4)
-        else -> throw IOException("Unknown wire type $wireType")
-    }
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseSuccessResult(): SuccessResult {
-    var titleDetailView: TitleDetailView? = null
-    var mangaViewer: MangaViewer? = null
-    var allTitlesView: AllTitlesView? = null
-    var titleRankingView: TitleRankingView? = null
-    var webHomeView: WebHomeView? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fieldNumber = (tag shr 3).toInt()
-        val wireType = (tag and 0x07).toInt()
-        when (fieldNumber) {
-            FIELD_TITLE_DETAIL_VIEW -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    titleDetailView = Buffer().apply { write(bytes) }.parseTitleDetailView()
-                } else skipField(wireType)
-            }
-            FIELD_MANGA_VIEWER -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    mangaViewer = Buffer().apply { write(bytes) }.parseMangaViewer()
-                } else skipField(wireType)
-            }
-            FIELD_ALL_TITLES_VIEW -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    allTitlesView = Buffer().apply { write(bytes) }.parseAllTitlesView()
-                } else skipField(wireType)
-            }
-            FIELD_TITLE_RANKING_VIEW -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    titleRankingView = Buffer().apply { write(bytes) }.parseTitleRankingView()
-                } else skipField(wireType)
-            }
-            FIELD_WEB_HOME_VIEW -> {
-                if (wireType == 2) {
-                    val bytes = readProtobufBytes()
-                    webHomeView = Buffer().apply { write(bytes) }.parseWebHomeView()
-                } else skipField(wireType)
-            }
-            else -> skipField(wireType)
-        }
-    }
-    return SuccessResult(titleRankingView, webHomeView, allTitlesView, titleDetailView, mangaViewer)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseTitle(): Title {
-    var titleId = 0
-    var name = ""
-    var author: String? = null
-    var portraitImageUrl = ""
-    var language = 0
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_TITLE_ID -> if (wt == 0) titleId = readProtobufVarint().toInt()
-            FIELD_TITLE_NAME -> if (wt == 2) name = readProtobufString()
-            FIELD_AUTHOR -> if (wt == 2) author = readProtobufString()
-            FIELD_PORTRAIT_IMAGE -> if (wt == 2) portraitImageUrl = readProtobufString()
-            FIELD_LANGUAGE -> if (wt == 0) language = readProtobufVarint().toInt()
-            else -> skipField(wt)
-        }
-    }
-    return Title(titleId, name, author, portraitImageUrl, language)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseTitleDetailView(): TitleDetailView {
-    var title: Title? = null
-    var overview = ""
-    var viewingPeriodDescription = ""
-    var nonAppearanceInfo = ""
-    val chapterListGroup = mutableListOf<ChapterListGroup>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_TITLE -> if (wt == 2) {
-                val bytes = readProtobufBytes()
-                title = Buffer().apply { write(bytes) }.parseTitle()
-            }
-            FIELD_OVERVIEW -> if (wt == 2) overview = readProtobufString()
-            FIELD_VIEWING_PERIOD -> if (wt == 2) viewingPeriodDescription = readProtobufString()
-            FIELD_NON_APPEARANCE -> if (wt == 2) nonAppearanceInfo = readProtobufString()
-            FIELD_CHAPTER_LIST_GROUP -> if (wt == 2) {
-                val bytes = readProtobufBytes()
-                chapterListGroup += Buffer().apply { write(bytes) }.parseChapterListGroup()
-            }
-            else -> skipField(wt)
-        }
-    }
-    return TitleDetailView(title!!, overview, viewingPeriodDescription, nonAppearanceInfo, chapterListGroup)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseChapterListGroup(): ChapterListGroup {
-    val first = mutableListOf<Chapter>()
-    val last = mutableListOf<Chapter>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_FIRST_CHAPTER_LIST -> if (wt == 2) {
-                val bytes = readProtobufBytes()
-                first += Buffer().apply { write(bytes) }.parseChapter()
-            }
-            FIELD_LAST_CHAPTER_LIST -> if (wt == 2) {
-                val bytes = readProtobufBytes()
-                last += Buffer().apply { write(bytes) }.parseChapter()
-            }
-            else -> skipField(wt)
-        }
-    }
-    return ChapterListGroup(first, last)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseChapter(): Chapter {
-    var chapterId = 0
-    var name = ""
-    var subTitle: String? = null
-    var startTimeStamp = 0
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_CHAPTER_ID -> if (wt == 0) chapterId = readProtobufVarint().toInt()
-            FIELD_CHAPTER_NAME -> if (wt == 2) name = readProtobufString()
-            FIELD_SUBTITLE -> if (wt == 2) subTitle = readProtobufString()
-            FIELD_START_TIMESTAMP -> if (wt == 0) startTimeStamp = readProtobufVarint().toInt()
-            else -> skipField(wt)
-        }
-    }
-    return Chapter(chapterId, name, subTitle, startTimeStamp)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseMangaViewer(): MangaViewer {
-    val pages = mutableListOf<MangaPlusPage>()
-    var titleId: Int? = null
-    var viewToken: String? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_PAGES -> if (wt == 2) {
-                val bytes = readProtobufBytes()
-                pages += Buffer().apply { write(bytes) }.parseMangaPlusPage()
-            }
-            FIELD_TITLE_ID_MV -> if (wt == 0) titleId = readProtobufVarint().toInt()
-            FIELD_VIEW_TOKEN -> if (wt == 2) viewToken = readProtobufString()
-            else -> skipField(wt)
-        }
-    }
-    return MangaViewer(pages, titleId, viewToken)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseMangaPlusPage(): MangaPlusPage {
-    var mangaPage: MPImagePage? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_MANGA_PAGE && wt == 2) {
-            val bytes = readProtobufBytes()
-            mangaPage = Buffer().apply { write(bytes) }.parseMPImagePage()
-        } else skipField(wt)
-    }
-    return MangaPlusPage(mangaPage)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseMPImagePage(): MPImagePage {
-    var imageUrl = ""
-    var encryptionKey: String? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        when (fn) {
-            FIELD_IMAGE_URL -> if (wt == 2) imageUrl = readProtobufString()
-            FIELD_ENCRYPTION_KEY -> if (wt == 2) encryptionKey = readProtobufString()
-            else -> skipField(wt)
-        }
-    }
-    return MPImagePage(imageUrl, encryptionKey)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseTitleRankingView(): TitleRankingView {
-    val ranked = mutableListOf<RankedTitle>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_RANKED_TITLES && wt == 2) {
-            val bytes = readProtobufBytes()
-            ranked += Buffer().apply { write(bytes) }.parseRankedTitle()
-        } else skipField(wt)
-    }
-    return TitleRankingView(ranked)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseRankedTitle(): RankedTitle {
-    val titles = mutableListOf<Title>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_RANKED_TITLE_TITLES && wt == 2) {
-            val bytes = readProtobufBytes()
-            titles += Buffer().apply { write(bytes) }.parseTitle()
-        } else skipField(wt)
-    }
-    return RankedTitle(titles)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseWebHomeView(): WebHomeView {
-    val groups = mutableListOf<UpdatedTitleGroup>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_GROUPS && wt == 2) {
-            val bytes = readProtobufBytes()
-            groups += Buffer().apply { write(bytes) }.parseUpdatedTitleGroup()
-        } else skipField(wt)
-    }
-    return WebHomeView(groups)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseUpdatedTitleGroup(): UpdatedTitleGroup {
-    val titles = mutableListOf<UpdatedTitle>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_GROUP_TITLES && wt == 2) {
-            val bytes = readProtobufBytes()
-            titles += Buffer().apply { write(bytes) }.parseUpdatedTitle()
-        } else skipField(wt)
-    }
-    return UpdatedTitleGroup(titles)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseUpdatedTitle(): UpdatedTitle {
-    var title: Title? = null
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_LATEST_CHAPTER && wt == 2) {
-            val bytes = readProtobufBytes()
-            val nested = Buffer().apply { write(bytes) }
-            while (!nested.exhausted()) {
-                val ntag = nested.readProtobufVarint()
-                val nfn = (ntag shr 3).toInt()
-                val nwt = (ntag and 0x07).toInt()
-                if (nfn == FIELD_LATEST_CHAPTER_TITLE && nwt == 2) {
-                    val titleBytes = nested.readProtobufBytes()
-                    title = Buffer().apply { write(titleBytes) }.parseTitle()
-                } else nested.skipField(nwt)
-            }
-        } else skipField(wt)
-    }
-    return UpdatedTitle(title)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseAllTitlesView(): AllTitlesView {
-    val groups = mutableListOf<AllTitlesGroup>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_ALL_TITLES_GROUP && wt == 2) {
-            val bytes = readProtobufBytes()
-            groups += Buffer().apply { write(bytes) }.parseAllTitlesGroup()
-        } else skipField(wt)
-    }
-    return AllTitlesView(groups)
-}
-
-@Throws(IOException::class)
-private fun Buffer.parseAllTitlesGroup(): AllTitlesGroup {
-    val titles = mutableListOf<Title>()
-    while (!exhausted()) {
-        val tag = readProtobufVarint()
-        val fn = (tag shr 3).toInt()
-        val wt = (tag and 0x07).toInt()
-        if (fn == FIELD_GROUP_TITLES_ALL && wt == 2) {
-            val bytes = readProtobufBytes()
-            titles += Buffer().apply { write(bytes) }.parseTitle()
-        } else skipField(wt)
-    }
-    return AllTitlesGroup(titles)
-}
+const val LANGUAGE_ENGLISH = 0
+const val LANGUAGE_SPANISH = 1
+const val LANGUAGE_FRENCH = 2
+const val LANGUAGE_INDONESIAN = 3
+const val LANGUAGE_PORTUGUESE_BR = 4
+const val LANGUAGE_RUSSIAN = 5
+const val LANGUAGE_THAI = 6
+const val LANGUAGE_GERMAN = 7
+const val LANGUAGE_VIETNAMESE = 9
 
 internal abstract class MangaPlusParser(
     context: MangaLoaderContext,
     source: MangaParserSource,
-    private val sourceLang: String,
     private val internalLangName: String,
-    private val internalLangCode: Int
+    private val internalLangCode: Int,
 ) : SinglePageMangaParser(context, source), Interceptor {
 
     override val configKeyDomain = ConfigKey.Domain("mangaplus.shueisha.co.jp")
@@ -563,19 +216,19 @@ internal abstract class MangaPlusParser(
     private val apiUrl = "https://jumpg-webapi.tokyo-cdn.com/api"
     private val session = UUID.randomUUID().toString()
     private val imageSemaphore = Semaphore(1)
-    private val detailsCacheLock = Any()
 
+    private val detailsCacheLock = Any()
     private val detailsCache = object : LinkedHashMap<String, Manga>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Manga>?): Boolean = size > 10
     }
 
     private val preferredServerKey = ConfigKey.PreferredImageServer(
         presetValues = mapOf(
-            one to "Low quality",
-            two to "High quality",
-            three to "Super high quality",
+            "low" to "Low quality",
+            "high" to "High quality",
+            "super_high" to "Super high quality",
         ),
-        defaultValue = two,
+        defaultValue = "high",
     )
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -585,65 +238,99 @@ internal abstract class MangaPlusParser(
     }
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
-        SortOrder.POPULARITY, SortOrder.UPDATED, SortOrder.ALPHABETICAL
+        SortOrder.POPULARITY, SortOrder.UPDATED, SortOrder.ALPHABETICAL,
     )
 
-    override val filterCapabilities = MangaListFilterCapabilities(isSearchSupported = true)
-    override suspend fun getFilterOptions() = MangaListFilterOptions()
+    override val filterCapabilities = MangaListFilterCapabilities(
+        isSearchSupported = true,
+        isMultipleTagsSupported = true,
+    )
 
-    private suspend fun apiCall(url: String): MPResponse {
-        val fullUrl = "$apiUrl$url".toHttpUrl().newBuilder().build()
+    override suspend fun getFilterOptions(): MangaListFilterOptions =
+        MangaListFilterOptions(availableTags = fetchGenreTags())
+    
+    private suspend fun apiCall(path: String): MangaPlusResponse {
+        val url = "$apiUrl$path".toHttpUrl()
         val headers = Headers.headersOf("SESSION-TOKEN", session)
-        val response = webClient.httpGet(fullUrl, headers)
-        val body = response.body
-        return Buffer().apply { write(body.bytes()) }.parseMPResponse()
+        return webClient.httpGet(url, headers).parseAsProto()
     }
 
+    private fun MangaPlusResponse.successOrThrow(): SuccessResult {
+        return success ?: run {
+            val popup = error?.langPopup(internalLangCode)
+            val message = popup?.body?.takeIf { it.isNotEmpty() }
+                ?: popup?.subject?.takeIf { it.isNotEmpty() }
+                ?: "Unknown MangaPlus error"
+            throw IOException(message)
+        }
+    }
+    
     override suspend fun getList(order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val query = filter.query
-        if (!query.isNullOrEmpty()) {
-            val resp = apiCall("/title_list/allV2")
-            val titles = resp.success?.allTitlesView?.allTitlesGroup?.flatMap { it.titles } ?: emptyList()
-            return titles.filterByLang().filter {
-                it.name.contains(query, true) || it.author?.contains(query, true) ?: false
-            }.map { it.toManga() }
+        val query = filter.query.orEmpty().trim()
+
+        if (filter.tags.isNotEmpty()) {
+            return searchWithGenres(filter.tags, query)
+        }
+
+        if (query.isNotEmpty()) {
+            return searchByText(query)
         }
 
         return when (order) {
-            SortOrder.POPULARITY -> {
-                val resp = apiCall("/title_list/rankingV2?lang=$internalLangName&type=hottest&clang=$internalLangName")
-                resp.success?.titleRankingView?.rankedTitles?.flatMap { it.titles }
-                    .orEmpty().filterByLang().map { it.toManga() }
-            }
-            SortOrder.UPDATED -> {
-                val latestResult = apiCall("/web/web_homeV4?lang=$internalLangName&clang=$internalLangName")
-                val allTitlesResult = apiCall("/title_list/allV2")
-
-                val latestTitles = latestResult.success?.webHomeView?.groups
-                    ?.flatMap { it.titles }
-                    ?.mapNotNull { it.title }
-                    ?.filterByLang()
-                    .orEmpty()
-
-                val allTitlesGroups = allTitlesResult.success?.allTitlesView?.allTitlesGroup
-                    .orEmpty()
-
-                val titles = latestTitles.mapNotNull { latestTitle ->
-                    allTitlesGroups
-                        .firstOrNull { group -> group.titles.any { it.titleId == latestTitle.titleId } }
-                        ?.titles
-                        ?.firstOrNull { it.language == internalLangCode }
-                }.distinctBy { it.titleId }
-
-                titles.map { it.toManga() }
-            }
-            SortOrder.ALPHABETICAL -> {
-                val resp = apiCall("/title_list/allV2")
-                resp.success?.allTitlesView?.allTitlesGroup?.flatMap { it.titles }
-                    .orEmpty().filterByLang().sortedBy { it.name.lowercase() }.map { it.toManga() }
-            }
+            SortOrder.POPULARITY -> getPopularity()
+            SortOrder.UPDATED -> getLatestUpdates()
+            SortOrder.ALPHABETICAL -> getAllTitlesAlphabetical()
             else -> emptyList()
         }
+    }
+
+    private suspend fun searchWithGenres(tags: Collection<MangaTag>, query: String): List<Manga> {
+        val resp = apiCall("/title_list/all_v3?type=serializing&lang=$internalLangName&clang=$internalLangName")
+        val entries = resp.success?.allTitlesViewV3?.titles.orEmpty()
+        return entries
+            .filter { entry ->
+                tags.any { tag -> entry.genres.any { it.slug == tag.key } } &&
+                        (query.isEmpty() ||
+                                entry.title.name.contains(query, true) ||
+                                entry.title.author?.contains(query, true) == true)
+            }
+            .map { it.title }
+            .filterByLang()
+            .map { it.toManga() }
+    }
+
+    private suspend fun searchByText(query: String): List<Manga> {
+        val resp = apiCall("/title_list/allV2")
+        return resp.success?.allTitlesView?.allTitlesGroup?.flatMap { it.titles }.orEmpty()
+            .filter { it.name.contains(query, true) || it.author?.contains(query, true) == true }
+            .filterByLang()
+            .map { it.toManga() }
+    }
+
+    private suspend fun getPopularity(): List<Manga> {
+        val resp = apiCall("/title_list/rankingV2?lang=$internalLangName&type=hottest&clang=$internalLangName")
+        return resp.success?.titleRankingView?.rankedTitles?.flatMap { it.titles }
+            .orEmpty().filterByLang().map { it.toManga() }
+    }
+
+    private suspend fun getLatestUpdates(): List<Manga> {
+        val resp = apiCall("/web/web_homeV4?lang=$internalLangName&clang=$internalLangName")
+        val home = resp.success?.webHomeView ?: return emptyList()
+        val entries = home.groups.flatMap { it.titles } + listOfNotNull(home.featured?.title)
+        return entries
+            .sortedByDescending { it.updatedAt }
+            .flatMap { it.latestChapters }
+            .map { it.title }
+            .filterByLang()
+            .map { it.toManga() }
+    }
+
+    private suspend fun getAllTitlesAlphabetical(): List<Manga> {
+        val resp = apiCall("/title_list/allV2")
+        return resp.success?.allTitlesView?.allTitlesGroup?.flatMap { it.titles }.orEmpty()
+            .filterByLang()
+            .sortedBy { it.name.lowercase() }
+            .map { it.toManga() }
     }
 
     private fun Title.toManga() = Manga(
@@ -661,46 +348,63 @@ internal abstract class MangaPlusParser(
         tags = emptySet(),
     )
 
-    private fun List<Title>.filterByLang() = filter { it.titleId != 0 && it.language == internalLangCode }.distinctBy { it.titleId }
-
+    private fun List<Title>.filterByLang(): List<Title> =
+        filter { it.titleId != 0 && it.language == internalLangCode }.distinctBy { it.titleId }
+    
     override suspend fun getDetails(manga: Manga): Manga {
         synchronized(detailsCacheLock) {
             detailsCache[manga.url]?.let { return it }
         }
 
         val resp = apiCall("/title_detailV3?title_id=${manga.url}&clang=$internalLangName")
-        val detail = resp.success?.titleDetailView ?: throw IOException("No detail")
-        val completed = detail.nonAppearanceInfo.contains(CompletedRegex) || detail.viewingPeriodDescription.contains("latest 0 chapters")
-        val hiatus = detail.nonAppearanceInfo.contains(Regex("on a hiatus", RegexOption.IGNORE_CASE))
+        val detail = resp.successOrThrow().titleDetailView
+            ?: throw IOException("Missing titleDetailView")
+
+        val isCompleted = detail.nonAppearanceInfo.contains(COMPLETED_REGEX) ||
+                detail.viewingPeriodDescription.contains("latest 0 chapters")
+        val isHiatus = detail.nonAppearanceInfo.contains(HIATUS_REGEX)
+
+        val tags = detail.genreList.mapNotNullTo(linkedSetOf()) { genre ->
+            genre.name.takeIf { it.isNotBlank() }?.let {
+                MangaTag(key = genre.slug, title = genre.name, source = source)
+            }
+        }
+
+        val chapters = detail.chapterList
+            .filter { !it.isExpired }
+            .map { chapter ->
+                MangaChapter(
+                    id = generateUid(chapter.chapterId.toString()),
+                    url = chapter.chapterId.toString(),
+                    title = "${chapter.name} - ${chapter.subTitle}",
+                    number = chapter.name.substringAfter("#").toFloatOrNull() ?: -1f,
+                    volume = 0,
+                    uploadDate = chapter.startTimeStamp * 1000L,
+                    branch = null,
+                    scanlator = null,
+                    source = source,
+                )
+            }
+
         val result = manga.copy(
             title = detail.title.name,
             coverUrl = detail.title.portraitImageUrl,
-            authors = detail.title.author?.split("/")?.joinToString(", ") { it.trim() }?.let { setOf(it) } ?: emptySet(),
-            description = listOfNotNull(detail.overview.takeIf { it.isNotEmpty() }, detail.viewingPeriodDescription.takeIf { it.isNotEmpty() }).joinToString("\n\n"),
+            authors = detail.title.author
+                ?.split("/")
+                ?.joinToString(", ") { it.trim() }
+                ?.let { setOf(it) }
+                ?: emptySet(),
+            description = listOfNotNull(
+                detail.overview.takeIf { it.isNotEmpty() },
+                detail.viewingPeriodDescription.takeIf { it.isNotEmpty() },
+            ).joinToString("\n\n"),
             state = when {
-                completed -> MangaState.FINISHED
-                hiatus -> MangaState.PAUSED
+                isCompleted -> MangaState.FINISHED
+                isHiatus -> MangaState.PAUSED
                 else -> MangaState.ONGOING
             },
-            chapters = detail.chapterListGroup
-                .flatMap { it.firstChapterList + it.lastChapterList }
-                .filter { it.subTitle != null }
-                .map { chapter ->
-                    MangaChapter(
-                        id = generateUid(chapter.chapterId.toString()),
-                        url = chapter.chapterId.toString(),
-                        title = chapter.subTitle ?: chapter.name,
-                        number = chapter.name.substringAfter("#").toFloatOrNull() ?: -1f,
-                        volume = 0,
-                        uploadDate = chapter.startTimeStamp * 1000L,
-                        branch = when (sourceLang) {
-                            "PORTUGUESE_BR" -> "Portuguese (Brazil)"
-                            else -> sourceLang.lowercase().toTitleCase()
-                        },
-                        scanlator = null,
-                        source = source,
-                    )
-                }
+            tags = tags,
+            chapters = chapters,
         )
 
         synchronized(detailsCacheLock) {
@@ -708,22 +412,23 @@ internal abstract class MangaPlusParser(
         }
         return result
     }
-
+    
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val quality = config[preferredServerKey]
-        val resp = apiCall("/manga_viewer_v3?chapter_id=${chapter.url}&split=yes&img_quality=$quality&clang=$internalLangName")
-        val viewer = resp.success?.mangaViewer ?: return emptyList()
-        val viewToken = viewer.viewToken ?: ""
-        return viewer.pages.mapNotNull { it.mangaPage }.map { mpImage ->
-            val baseUrl = mpImage.imageUrl
-            val encryptionKey = mpImage.encryptionKey
-            val separator = if (baseUrl.contains("?")) "&" else "?"
+        val resp = apiCall(
+            "/manga_viewer_v3?chapter_id=${chapter.url}&split=yes&img_quality=$quality&clang=$internalLangName",
+        )
+        val viewer = resp.successOrThrow().mangaViewer ?: return emptyList()
+        val viewToken = viewer.viewToken.orEmpty()
+        return viewer.pages.mapNotNull { it.mangaPage }.mapNotNull { image ->
+            if (image.imageUrl.isBlank()) return@mapNotNull null
+            val encryptionKey = image.encryptionKey
+            val separator = if (image.imageUrl.contains("?")) "&" else "?"
             val fullUrl = buildString {
-                append(baseUrl)
+                append(image.imageUrl)
                 append(separator).append("vtoken=").append(viewToken)
                 if (encryptionKey != null) append("#").append(encryptionKey)
             }
-
             MangaPage(
                 id = generateUid(fullUrl),
                 url = fullUrl,
@@ -732,7 +437,31 @@ internal abstract class MangaPlusParser(
             )
         }
     }
+    
+    @Volatile
+    private var tagsCache: Set<MangaTag>? = null
+    private val tagsMutex = Mutex()
 
+    private suspend fun fetchGenreTags(): Set<MangaTag> {
+        tagsCache?.let { return it }
+        return tagsMutex.withLock {
+            tagsCache ?: run {
+                val resp = apiCall(
+                    "/title_list/all_v3?type=serializing&lang=$internalLangName&clang=$internalLangName",
+                )
+                val tags = resp.success?.allTitlesViewV3?.tags.orEmpty()
+                    .mapNotNull { tag ->
+                        tag.name.takeIf { it.isNotBlank() }?.let {
+                            MangaTag(key = tag.slug, title = tag.name, source = source)
+                        }
+                    }
+                    .toSet()
+                tagsCache = tags
+                tags
+            }
+        }
+    }
+    
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val url = request.url
@@ -750,21 +479,18 @@ internal abstract class MangaPlusParser(
         }
     }
 
-    private fun processImageRequest(chain: Interceptor.Chain, request: okhttp3.Request, url: okhttp3.HttpUrl): Response {
+    private fun processImageRequest(
+        chain: Interceptor.Chain,
+        request: Request,
+        url: okhttp3.HttpUrl,
+    ): Response {
         val encryptionKey = url.fragment
         val vtoken = url.queryParameter("vtoken")
 
-        val newUrl = url.newBuilder()
-            .removeAllQueryParameters("vtoken")
-            .build()
-
+        val newUrl = url.newBuilder().removeAllQueryParameters("vtoken").build()
         val newRequest = request.newBuilder()
             .url(newUrl)
-            .apply {
-                if (vtoken != null) {
-                    header("Plus-Vw-Token", vtoken)
-                }
-            }
+            .apply { if (vtoken != null) header("Plus-Vw-Token", vtoken) }
             .build()
 
         val response = chain.proceed(newRequest)
@@ -782,35 +508,45 @@ internal abstract class MangaPlusParser(
             .body(decrypted.toResponseBody(contentType.toMediaTypeOrNull()))
             .build()
     }
-
-    companion object {
-        private val CompletedRegex = Regex("completado|completed?|completo", RegexOption.IGNORE_CASE)
+    
+    private companion object {
+        val COMPLETED_REGEX = Regex("completado|completed?|completo", RegexOption.IGNORE_CASE)
+        val HIATUS_REGEX = Regex("on a hiatus", RegexOption.IGNORE_CASE)
     }
 
     @MangaSourceParser("MANGAPLUSPARSER_EN", "MANGA Plus (English)", "en")
-    class English(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_EN, "ENGLISH", "eng", 0)
+    class English(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_EN, "eng", LANGUAGE_ENGLISH)
 
     @MangaSourceParser("MANGAPLUSPARSER_ES", "MANGA Plus (Spanish)", "es")
-    class Spanish(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_ES, "SPANISH", "esp", 1)
+    class Spanish(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_ES, "esp", LANGUAGE_SPANISH)
 
     @MangaSourceParser("MANGAPLUSPARSER_FR", "MANGA Plus (French)", "fr")
-    class French(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_FR, "FRENCH", "fra", 2)
+    class French(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_FR, "fra", LANGUAGE_FRENCH)
 
     @MangaSourceParser("MANGAPLUSPARSER_ID", "MANGA Plus (Indonesian)", "id")
-    class Indonesian(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_ID, "INDONESIAN", "ind", 3)
+    class Indonesian(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_ID, "ind", LANGUAGE_INDONESIAN)
 
     @MangaSourceParser("MANGAPLUSPARSER_PTBR", "MANGA Plus Portuguese (Brazil)", "pt")
-    class Portuguese(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_PTBR, "PORTUGUESE_BR", "ptb", 4)
+    class Portuguese(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_PTBR, "ptb", LANGUAGE_PORTUGUESE_BR)
 
     @MangaSourceParser("MANGAPLUSPARSER_RU", "MANGA Plus (Russian)", "ru")
-    class Russian(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_RU, "RUSSIAN", "rus", 5)
+    class Russian(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_RU, "rus", LANGUAGE_RUSSIAN)
 
     @MangaSourceParser("MANGAPLUSPARSER_TH", "MANGA Plus (Thai)", "th")
-    class Thai(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_TH, "THAI", "tha", 6)
+    class Thai(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_TH, "tha", LANGUAGE_THAI)
 
     @MangaSourceParser("MANGAPLUSPARSER_VI", "MANGA Plus (Vietnamese)", "vi")
-    class Vietnamese(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_VI, "VIETNAMESE", "vie", 9)
+    class Vietnamese(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_VI, "vie", LANGUAGE_VIETNAMESE)
 
     @MangaSourceParser("MANGAPLUSPARSER_DE", "MANGA Plus (German)", "de")
-    class German(context: MangaLoaderContext) : MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_DE, "GERMAN", "deu", 7)
+    class German(context: MangaLoaderContext) :
+        MangaPlusParser(context, MangaParserSource.MANGAPLUSPARSER_DE, "deu", LANGUAGE_GERMAN)
 }

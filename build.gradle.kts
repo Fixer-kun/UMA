@@ -59,6 +59,10 @@ dependencies {
     implementation(libs.json)
     implementation(libs.androidx.collection)
 
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.kotlinx.serialization.json.okio)
+    implementation(libs.kotlinx.serialization.protobuf)
+
     api(libs.tsuki)
     api(libs.jsoup)
 

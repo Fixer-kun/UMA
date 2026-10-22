@@ -30,7 +30,7 @@ import org.jsoup.nodes.Element
 import java.time.Instant
 import java.util.EnumSet
 
-@MangaSourceParser("MANHWAZ", "ManhwaZ", "en", ContentType.MANHWA)
+@MangaSourceParser("MANHWAZ", "ManhwaZ (unoriginal)", "en", ContentType.MANHWA)
 internal class Manhwaz(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANHWAZ, 40) {
 

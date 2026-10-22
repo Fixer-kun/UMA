@@ -6,6 +6,8 @@ import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
 
 import tsuki.model.ContentType
+import tsuki.model.Favicon
+import tsuki.model.Favicons
 import tsuki.model.Manga
 import tsuki.model.MangaChapter
 import tsuki.model.MangaListFilter
@@ -17,8 +19,6 @@ import tsuki.model.MangaState
 import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
-import tsuki.model.Favicon
-import tsuki.model.Favicons
 
 import tsuki.util.generateUid
 import tsuki.util.oneOrThrowIfMany
@@ -39,28 +39,33 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @MangaSourceParser("WESTMANGA", "WestManga", "id")
-internal class WestmangaParser(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.WESTMANGA, pageSize = 20) {
+internal class Westmanga(context: MangaLoaderContext) :
+    PagedMangaParser(context, MangaParserSource.WESTMANGA, 20) {
 
-    override val configKeyDomain = ConfigKey.Domain("westmanga.co")
+    override val configKeyDomain = ConfigKey.Domain("v1.westmanga.my")
 
-    private val apiDomain: String
-        get() = "data.mantweh.online"
+    private val apiScheme: String get() = "https"
+    private val apiDomain: String get() = domain
 
-    override suspend fun getFavicons(): Favicons {
-        return Favicons(
-            listOf(
-                Favicon("https://$domain/favicon.ico", 48, null),
-            ),
-            domain,
-        )
-    }
+    private val staticAuth = "Bearer Bearer HAHAHA Jones"
 
     private val accessKey = "WM_WEB_FRONT_END"
     private val secretKey = "xxxoidj"
 
     private var genresCache: Set<MangaTag>? = null
     private val mutex = Mutex()
+
+    private data class VisitToken(val token: String, val expiresAt: Long)
+    @Volatile private var visitToken: VisitToken? = null
+    private val visitTokenMutex = Mutex()
+    private val visitTokenRefreshBufferMillis = 5 * 60_000L // 5 minutes, matching the site's logic
+
+    override suspend fun getFavicons(): Favicons {
+        return Favicons(
+            listOf(Favicon("$apiScheme://$domain/favicon.ico", 48, null)),
+            domain,
+        )
+    }
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -91,12 +96,12 @@ internal class WestmangaParser(context: MangaLoaderContext) :
     )
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = "https://$apiDomain/api/contents".toHttpUrl().newBuilder().apply {
+        val url = "$apiScheme://$apiDomain/api/contents".toHttpUrl().newBuilder().apply {
             if (!filter.query.isNullOrEmpty()) {
                 addQueryParameter("q", filter.query)
             }
             addQueryParameter("page", page.toString())
-            addQueryParameter("per_page", "20")
+            addQueryParameter("per_page", pageSize.toString())
             addQueryParameter("type", "Comic")
 
             when (order) {
@@ -112,21 +117,27 @@ internal class WestmangaParser(context: MangaLoaderContext) :
             }
 
             filter.states.oneOrThrowIfMany()?.let {
-                addQueryParameter("status", when (it) {
-                    MangaState.ONGOING -> "ongoing"
-                    MangaState.FINISHED -> "completed"
-                    MangaState.PAUSED -> "hiatus"
-                    else -> return@let
-                })
+                addQueryParameter(
+                    "status",
+                    when (it) {
+                        MangaState.ONGOING -> "ongoing"
+                        MangaState.FINISHED -> "completed"
+                        MangaState.PAUSED -> "hiatus"
+                        else -> return@let
+                    },
+                )
             }
 
             filter.types.oneOrThrowIfMany()?.let {
-                addQueryParameter("country", when (it) {
-                    ContentType.MANGA -> "JP"
-                    ContentType.MANHWA -> "KR"
-                    ContentType.MANHUA -> "CN"
-                    else -> return@let
-                })
+                addQueryParameter(
+                    "country",
+                    when (it) {
+                        ContentType.MANGA -> "JP"
+                        ContentType.MANHWA -> "KR"
+                        ContentType.MANHUA -> "CN"
+                        else -> return@let
+                    },
+                )
             }
         }.build()
 
@@ -140,7 +151,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
                 title = jo.getString("title"),
                 altTitles = emptySet(),
                 url = "/manga/$slug/",
-                publicUrl = "https://$domain/comic/$slug",
+                publicUrl = "$apiScheme://$domain/comic/$slug",
                 rating = RATING_UNKNOWN,
                 contentRating = null,
                 coverUrl = jo.getString("cover"),
@@ -154,7 +165,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.removeSurrounding("/manga/", "/")
-        val url = "https://$apiDomain/api/comic/$slug".toHttpUrl()
+        val url = "$apiScheme://$apiDomain/api/comic/$slug".toHttpUrl()
 
         val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
         val data = response.getJSONObject("data")
@@ -176,7 +187,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
                             title = genre.getString("name"),
                             key = genre.getInt("id").toString(),
                             source = source,
-                        )
+                        ),
                     )
                 }
             }
@@ -229,7 +240,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val slug = chapter.url.removeSurrounding("/", "/")
-        val url = "https://$apiDomain/api/v/$slug".toHttpUrl()
+        val url = "$apiScheme://$apiDomain/api/v/$slug".toHttpUrl()
 
         val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
         val images = response.optJSONObject("data")?.getJSONArray("images")
@@ -244,7 +255,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
                     url = imageUrl,
                     preview = null,
                     source = source,
-                )
+                ),
             )
         }
         return pages
@@ -253,7 +264,7 @@ internal class WestmangaParser(context: MangaLoaderContext) :
     private suspend fun fetchGenres(): Set<MangaTag> = mutex.withLock {
         genresCache?.let { return@withLock it }
 
-        val url = "https://$apiDomain/api/contents/genres".toHttpUrl()
+        val url = "$apiScheme://$apiDomain/api/contents/genres".toHttpUrl()
         val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
         val genresArray = response.optJSONArray("data") ?: return@withLock emptySet()
 
@@ -269,7 +280,50 @@ internal class WestmangaParser(context: MangaLoaderContext) :
         return@withLock genres
     }
 
-    private fun createApiHeaders(url: HttpUrl): Headers {
+    private suspend fun getVisitToken(): String {
+        val now = System.currentTimeMillis()
+        visitToken?.let { cached ->
+            if (cached.expiresAt - now > visitTokenRefreshBufferMillis) {
+                return cached.token
+            }
+        }
+        return visitTokenMutex.withLock {
+            val now2 = System.currentTimeMillis()
+            visitToken?.let { cached ->
+                if (cached.expiresAt - now2 > visitTokenRefreshBufferMillis) {
+                    return@withLock cached.token
+                }
+            }
+            val fresh = fetchVisitToken()
+            visitToken = fresh
+            fresh.token
+        }
+    }
+
+    private suspend fun fetchVisitToken(): VisitToken {
+        val now = System.currentTimeMillis()
+        val url = "$apiScheme://$apiDomain/api/visit-token".toHttpUrl()
+        val response = webClient.httpGet(url, baseHeaders()).parseJson()
+
+        val data = response.optJSONObject("data") ?: response
+        val token = data.getString("token")
+        val expiresAtRaw = data.getLongOrDefault("expires_at", 0L)
+        val expiresAtMs = when {
+            expiresAtRaw <= 0L -> now + 10 * 60_000L // fallback
+            expiresAtRaw < 10_000_000_000L -> expiresAtRaw * 1000L // seconds
+            else -> expiresAtRaw // milliseconds
+        }
+        return VisitToken(token, expiresAtMs)
+    }
+
+    private fun baseHeaders(): Headers = Headers.Builder()
+        .add("User-Agent", config[userAgentKey])
+        .add("Referer", "$apiScheme://$domain/")
+        .add("Origin", "$apiScheme://$domain")
+        .add("Authorization", staticAuth)
+        .build()
+
+    private suspend fun createApiHeaders(url: HttpUrl): Headers {
         val timestamp = (System.currentTimeMillis() / 1000).toString()
         val message = "wm-api-request"
         val key = timestamp + "GET" + url.encodedPath + accessKey + secretKey
@@ -282,7 +336,10 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 
         return Headers.Builder()
             .add("User-Agent", config[userAgentKey])
-            .add("Referer", "https://$domain/")
+            .add("Referer", "$apiScheme://$domain/")
+            .add("Origin", "$apiScheme://$domain")
+            .add("Authorization", staticAuth)
+            .add("X-WM-Visit", getVisitToken())
             .add("x-wm-request-time", timestamp)
             .add("x-wm-accses-key", accessKey)
             .add("x-wm-request-signature", signature)

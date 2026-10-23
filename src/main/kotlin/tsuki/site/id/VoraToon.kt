@@ -23,6 +23,8 @@ import tsuki.util.oneOrThrowIfMany
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
@@ -31,15 +33,37 @@ import java.util.Locale
 
 @MangaSourceParser("VORATOON", "VoraToon", "id")
 internal class VoraToon(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.VORATOON, pageSize = 30) {
+    PagedMangaParser(context, MangaParserSource.VORATOON, 30) {
 
-    override val configKeyDomain = ConfigKey.Domain("v6.voratoon.com")
+    override val configKeyDomain = ConfigKey.Domain("v8.voratoon.com")
 
-    private val apiBase = "https://api.voratoon.com"
+    private val apiBase = "https://$domain/api/proxy"
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+
+        if (response.code == 403 &&
+            request.url.host == domain &&
+            request.url.encodedPath.contains("/api/")
+        ) {
+            response.close()
+            runCatching {
+                chain.proceed(
+                    request.newBuilder()
+                        .url("https://$domain/")
+                        .headers(request.headers.newBuilder().removeAll("Accept").build())
+                        .build(),
+                ).close()
+            }
+            return chain.proceed(request)
+        }
+        return response
     }
 
     override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
@@ -47,6 +71,7 @@ internal class VoraToon(context: MangaLoaderContext) :
         .add("Origin", "https://$domain")
         .add("Accept", "application/json")
         .add("Accept-language", "en-US,en;q=0.9,id;q=0.8")
+        .add("sec-fetch-site", "same-origin")
         .build()
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
@@ -138,8 +163,8 @@ internal class VoraToon(context: MangaLoaderContext) :
             }
 
             if (filter.tags.isNotEmpty()) {
-                append("&genreIds=")
-                append(filter.tags.joinToString(",") { it.key })
+                val rsql = filter.tags.joinToString(";") { "genreIds==${it.key}" }
+                append("&filter=").append(URLEncoder.encode(rsql, "UTF-8"))
             }
         }
 

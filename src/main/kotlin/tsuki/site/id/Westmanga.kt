@@ -38,6 +38,8 @@ import java.util.EnumSet
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+import tsuki.Broken
+@Broken
 @MangaSourceParser("WESTMANGA", "WestManga", "id")
 internal class Westmanga(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.WESTMANGA, 20) {

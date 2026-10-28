@@ -337,6 +337,7 @@ internal class XCOMIC(context: MangaLoaderContext) :
         }
 
         val activeLangs = query.translatedLanguages.filter { it.isNotBlank() }.distinct()
+            .ifEmpty { listOf("en") }
         val langParam = if (activeLangs.isEmpty()) "" else "?lang=" + activeLangs.joinToString(",")
 
         val data = postGraphQL(

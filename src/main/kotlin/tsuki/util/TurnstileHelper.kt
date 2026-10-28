@@ -69,7 +69,7 @@ suspend fun getTurnstileToken(
         "document.open(); document.write(${JSONObject.quote(html)}); document.close();",
     )
 
-    /** 2. Poll the live page. Empty baseUrl ⇒ no reload, so the widget survives */
+    /** Poll the live page. Empty baseUrl ⇒ no reload, so the widget survives */
     val deadline = System.currentTimeMillis() + timeoutMs
     while (System.currentTimeMillis() < deadline) {
         val result = context.evaluateJs(

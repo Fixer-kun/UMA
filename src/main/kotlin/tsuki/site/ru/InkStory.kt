@@ -35,15 +35,20 @@ import tsuki.util.urlBuilder
 import androidx.collection.ArrayMap
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.asResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
 
-@MangaSourceParser("MANGAWTF", "MangaWtf", "ru")
-internal class MangaWtf(context: MangaLoaderContext) : 
-    PagedMangaParser(context, MangaParserSource.MANGAWTF, pageSize = 20) {
+@MangaSourceParser("MANGAWTF", "InkStory", "ru")
+internal class InkStory(context: MangaLoaderContext) :
+    PagedMangaParser(context, MangaParserSource.MANGAWTF, 20), Interceptor {
 
     override val availableSortOrders: Set<SortOrder> =
         EnumSet.of(
@@ -183,18 +188,22 @@ internal class MangaWtf(context: MangaLoaderContext) :
                 .addPathSegment("chapters")
                 .addPathSegment(chapter.url)
         val json = webClient.httpGet(url.build()).parseJson()
-        return json.getJSONArray("pages").mapJSON { jo ->
-            MangaPage(
-                id = generateUid(jo.getString("id")),
-                url = jo.getString("image").toHttpUrl().newBuilder()
-                    .setQueryParameter("format", "webp")
-                    .setQueryParameter("width", "1600")
-                    .build()
-                    .toString(),
-                preview = null,
-                source = source,
+        val pagesArray = json.getJSONArray("pages")
+        val list = mutableListOf<Pair<Int, MangaPage>>()
+        for (i in 0 until pagesArray.length()) {
+            val jo = pagesArray.getJSONObject(i)
+            val index = jo.optInt("index", Int.MAX_VALUE)
+            val imageUrl = jo.getString("image")
+            list.add(
+                index to MangaPage(
+                    id = generateUid(jo.getString("id")),
+                    url = normalizeImageUrl(imageUrl),
+                    preview = null,
+                    source = source,
+                )
             )
         }
+        return list.sortedBy { it.first }.map { it.second }
     }
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
@@ -287,5 +296,120 @@ internal class MangaWtf(context: MangaLoaderContext) :
             authors = emptySet(),
             source = source,
         )
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        if (!response.isSuccessful) return response
+
+        val contentType = response.body?.contentType()
+        if (contentType?.subtype == "json") return response
+
+        if (detectImageCodec(response.request.url.toString()) != ImageCodec.XOR) {
+            return response
+        }
+
+        val source = response.body?.source() ?: return response
+        val buffer = Buffer()
+        source.readAll(buffer)
+
+        if (buffer.size < MIN_IMAGE_SIGNATURE_SIZE) {
+            return response.newBuilder()
+                .body(buffer.asResponseBody(contentType, buffer.size))
+                .build()
+        }
+
+        val peek = buffer.peek().readByteArray(MIN_IMAGE_SIGNATURE_SIZE.toLong())
+        if (looksLikeImage(peek) != null) {
+            return response.newBuilder()
+                .body(buffer.asResponseBody(contentType, buffer.size))
+                .build()
+        }
+
+        val decryptedHeader = ByteArray(MIN_IMAGE_SIGNATURE_SIZE) { index ->
+            (peek[index].toInt() xor SECRET_KEY_BYTES[index % SECRET_KEY_BYTES.size].toInt()).toByte()
+        }
+
+        val detectedType = looksLikeImage(decryptedHeader)
+            ?: return response.newBuilder()
+                .body(buffer.asResponseBody(contentType, buffer.size))
+                .build()
+
+        val payload = buffer.readByteArray()
+        for (i in payload.indices) {
+            payload[i] = (payload[i].toInt() xor SECRET_KEY_BYTES[i % SECRET_KEY_BYTES.size].toInt()).toByte()
+        }
+
+        val mediaType = detectedType.toMediaType()
+        return response.newBuilder()
+            .body(payload.toResponseBody(mediaType))
+            .build()
+    }
+
+    private fun detectImageCodec(imageUrl: String): ImageCodec? {
+        val fileName = imageUrl.substringAfterLast('/').substringBefore('?')
+        val baseName = fileName.substringBeforeLast('.', missingDelimiterValue = fileName)
+        if (baseName.length != IMAGE_NAME_LENGTH) return null
+        return when (baseName.getOrNull(IMAGE_MODE_INDEX)) {
+            's' -> ImageCodec.SEC
+            'x' -> ImageCodec.XOR
+            else -> null
+        }
+    }
+
+    private fun normalizeImageUrl(imageUrl: String): String =
+        if (detectImageCodec(imageUrl) == ImageCodec.SEC) {
+            replaceFileNameMode(imageUrl)
+        } else {
+            imageUrl
+        }
+
+    private fun replaceFileNameMode(imageUrl: String, replacementMode: Char = 'x'): String {
+        val lastSlash = imageUrl.lastIndexOf('/')
+        if (lastSlash == -1) return imageUrl
+        val modeIndex = lastSlash + 1 + IMAGE_MODE_INDEX
+        if (modeIndex >= imageUrl.length) return imageUrl
+        val chars = imageUrl.toCharArray()
+        chars[modeIndex] = replacementMode
+        return String(chars)
+    }
+
+    private fun looksLikeImage(payload: ByteArray): String? {
+        if (payload.size < MIN_IMAGE_SIGNATURE_SIZE) return null
+
+        val isJpeg = payload[0] == 0xFF.toByte() && payload[1] == 0xD8.toByte() && payload[2] == 0xFF.toByte()
+        if (isJpeg) return "image/jpeg"
+
+        val isPng = payload[0] == 0x89.toByte() && payload[1] == 0x50.toByte() &&
+                payload[2] == 0x4E.toByte() && payload[3] == 0x47.toByte()
+        if (isPng) return "image/png"
+
+        val isGif = payload[0] == 0x47.toByte() && payload[1] == 0x49.toByte() &&
+                payload[2] == 0x46.toByte() && payload[3] == 0x38.toByte()
+        if (isGif) return "image/gif"
+
+        val isWebp = payload[0] == 0x52.toByte() && payload[1] == 0x49.toByte() &&
+                payload[2] == 0x46.toByte() && payload[3] == 0x46.toByte() &&
+                payload[8] == 0x57.toByte() && payload[9] == 0x45.toByte() &&
+                payload[10] == 0x42.toByte() && payload[11] == 0x50.toByte()
+        if (isWebp) return "image/webp"
+
+        val isAvif = payload[4] == 0x66.toByte() && payload[5] == 0x74.toByte() &&
+                payload[6] == 0x79.toByte() && payload[7] == 0x70.toByte() &&
+                payload[8] == 0x61.toByte() && payload[9] == 0x76.toByte() &&
+                payload[10] == 0x69.toByte()
+        if (isAvif) return "image/avif"
+
+        return null
+    }
+
+    private enum class ImageCodec { SEC, XOR }
+
+    private companion object {
+        const val MIN_IMAGE_SIGNATURE_SIZE = 12
+        const val IMAGE_NAME_LENGTH = 36
+        const val IMAGE_MODE_INDEX = 14
+        const val SECRET_KEY = "UySkp0BzPhwlvP2V"
+        val SECRET_KEY_BYTES = SECRET_KEY.toByteArray()
     }
 }

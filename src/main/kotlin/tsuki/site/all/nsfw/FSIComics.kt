@@ -254,7 +254,7 @@ internal abstract class FSIComicsParser(
             source = source,
         )
     }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val url = (baseUrl + manga.url).toHttpUrl()
         val doc = webClient.httpGet(url).parseHtml()
@@ -295,7 +295,7 @@ internal abstract class FSIComicsParser(
             chapters = listOf(chapter),
         )
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val url = (baseUrl + chapter.url).toHttpUrl()
         val doc = webClient.httpGet(url).parseHtml()
@@ -308,7 +308,7 @@ internal abstract class FSIComicsParser(
                 MangaPage(id = generateUid(imgUrl), url = imgUrl, preview = null, source = source)
             }
     }
-    
+
     private suspend fun fetchCategories(): List<WPCategory> {
         val all = mutableListOf<WPCategory>()
         var page = 1
@@ -348,22 +348,22 @@ internal abstract class FSIComicsParser(
     )
 }
 
-@MangaSourceParser("FSICOMICS_EN", "FSI Comics (EN)", "en", ContentType.COMICS)
+@MangaSourceParser("FSICOMICS_EN", "FSI Comics (EN)", "en", ContentType.HENTAI)
 internal class FSIComicsEN(context: MangaLoaderContext) :
     FSIComicsParser(context, MangaParserSource.FSICOMICS_EN, "en", "fsicomics.com")
 
-@MangaSourceParser("FSICOMICS_ES", "FSI Comics (ES)", "es", ContentType.COMICS)
+@MangaSourceParser("FSICOMICS_ES", "FSI Comics (ES)", "es", ContentType.HENTAI)
 internal class FSIComicsES(context: MangaLoaderContext) :
     FSIComicsParser(context, MangaParserSource.FSICOMICS_ES, "es", "es.fsicomics.com")
 
-@MangaSourceParser("FSICOMICS_DE", "FSI Comics (DE)", "de", ContentType.COMICS)
+@MangaSourceParser("FSICOMICS_DE", "FSI Comics (DE)", "de", ContentType.HENTAI)
 internal class FSIComicsDE(context: MangaLoaderContext) :
     FSIComicsParser(context, MangaParserSource.FSICOMICS_DE, "de", "de.fsicomics.com")
 
-@MangaSourceParser("FSICOMICS_FR", "FSI Comics (FR)", "fr", ContentType.COMICS)
+@MangaSourceParser("FSICOMICS_FR", "FSI Comics (FR)", "fr", ContentType.HENTAI)
 internal class FSIComicsFR(context: MangaLoaderContext) :
     FSIComicsParser(context, MangaParserSource.FSICOMICS_FR, "fr", "fr.fsicomics.com")
 
-@MangaSourceParser("FSICOMICS_IT", "FSI Comics (IT)", "it", ContentType.COMICS)
+@MangaSourceParser("FSICOMICS_IT", "FSI Comics (IT)", "it", ContentType.HENTAI)
 internal class FSIComicsIT(context: MangaLoaderContext) :
     FSIComicsParser(context, MangaParserSource.FSICOMICS_IT, "it", "it.fsicomics.com")

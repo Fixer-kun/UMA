@@ -33,13 +33,11 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.jsoup.Jsoup
 import java.util.EnumSet
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
-import tsuki.Broken
-@Broken
 @MangaSourceParser("WESTMANGA", "WestManga", "id")
 internal class Westmanga(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.WESTMANGA, 20) {
@@ -48,11 +46,6 @@ internal class Westmanga(context: MangaLoaderContext) :
 
     private val apiScheme: String get() = "https"
     private val apiDomain: String get() = domain
-
-    private val staticAuth = "Bearer Bearer HAHAHA Jones"
-
-    private val accessKey = "WM_WEB_FRONT_END"
-    private val secretKey = "xxxoidj"
 
     private var genresCache: Set<MangaTag>? = null
     private val mutex = Mutex()
@@ -143,7 +136,7 @@ internal class Westmanga(context: MangaLoaderContext) :
             }
         }.build()
 
-        val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
+        val response = apiGet(url)
         val mangaArray = response.optJSONArray("data") ?: return emptyList()
 
         return mangaArray.mapJSON { jo ->
@@ -156,7 +149,7 @@ internal class Westmanga(context: MangaLoaderContext) :
                 publicUrl = "$apiScheme://$domain/comic/$slug",
                 rating = RATING_UNKNOWN,
                 contentRating = null,
-                coverUrl = jo.getString("cover"),
+                coverUrl = absoluteUrl(jo.getString("cover")),
                 tags = emptySet(),
                 state = null,
                 authors = emptySet(),
@@ -169,7 +162,7 @@ internal class Westmanga(context: MangaLoaderContext) :
         val slug = manga.url.removeSurrounding("/manga/", "/")
         val url = "$apiScheme://$apiDomain/api/comic/$slug".toHttpUrl()
 
-        val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
+        val response = apiGet(url)
         val data = response.getJSONObject("data")
 
         val tags = buildSet {
@@ -231,7 +224,7 @@ internal class Westmanga(context: MangaLoaderContext) :
 
         return manga.copy(
             title = data.getString("title"),
-            coverUrl = data.getString("cover"),
+            coverUrl = absoluteUrl(data.getString("cover")),
             tags = tags,
             authors = setOfNotNull(data.getStringOrNull("author")),
             description = description.takeIf { it.isNotEmpty() },
@@ -244,13 +237,13 @@ internal class Westmanga(context: MangaLoaderContext) :
         val slug = chapter.url.removeSurrounding("/", "/")
         val url = "$apiScheme://$apiDomain/api/v/$slug".toHttpUrl()
 
-        val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
+        val response = apiGet(url)
         val images = response.optJSONObject("data")?.getJSONArray("images")
             ?: response.getJSONArray("images")
 
         val pages = ArrayList<MangaPage>(images.length())
         for (i in 0 until images.length()) {
-            val imageUrl = images.getString(i)
+            val imageUrl = absoluteUrl(images.getString(i))
             pages.add(
                 MangaPage(
                     id = generateUid(imageUrl),
@@ -267,7 +260,7 @@ internal class Westmanga(context: MangaLoaderContext) :
         genresCache?.let { return@withLock it }
 
         val url = "$apiScheme://$apiDomain/api/contents/genres".toHttpUrl()
-        val response = webClient.httpGet(url, createApiHeaders(url)).parseJson()
+        val response = apiGet(url)
         val genresArray = response.optJSONArray("data") ?: return@withLock emptySet()
 
         val genres = genresArray.mapJSONToSet { genreObj ->
@@ -282,24 +275,19 @@ internal class Westmanga(context: MangaLoaderContext) :
         return@withLock genres
     }
 
-    private suspend fun getVisitToken(): String {
+    private suspend fun getVisitToken(forceRefresh: Boolean = false): String? = visitTokenMutex.withLock {
         val now = System.currentTimeMillis()
-        visitToken?.let { cached ->
-            if (cached.expiresAt - now > visitTokenRefreshBufferMillis) {
-                return cached.token
-            }
+        val cached = visitToken
+        if (!forceRefresh && cached != null && cached.expiresAt - now > visitTokenRefreshBufferMillis) {
+            return@withLock cached.token
         }
-        return visitTokenMutex.withLock {
-            val now2 = System.currentTimeMillis()
-            visitToken?.let { cached ->
-                if (cached.expiresAt - now2 > visitTokenRefreshBufferMillis) {
-                    return@withLock cached.token
-                }
-            }
-            val fresh = fetchVisitToken()
+        val fresh = runCatching { fetchVisitToken() }.getOrNull()
+        if (fresh != null) {
             visitToken = fresh
-            fresh.token
+            return@withLock fresh.token
         }
+        if (forceRefresh) visitToken = null
+        visitToken?.token
     }
 
     private suspend fun fetchVisitToken(): VisitToken {
@@ -311,40 +299,34 @@ internal class Westmanga(context: MangaLoaderContext) :
         val token = data.getString("token")
         val expiresAtRaw = data.getLongOrDefault("expires_at", 0L)
         val expiresAtMs = when {
-            expiresAtRaw <= 0L -> now + 10 * 60_000L // fallback
+            expiresAtRaw <= 0L -> now + 60 * 60_000L // fallback: 1 hour
             expiresAtRaw < 10_000_000_000L -> expiresAtRaw * 1000L // seconds
             else -> expiresAtRaw // milliseconds
         }
         return VisitToken(token, expiresAtMs)
     }
 
+    private fun absoluteUrl(path: String): String =
+        if (path.startsWith("http")) path else "$apiScheme://$domain${if (path.startsWith('/')) "" else "/"}$path"
+
     private fun baseHeaders(): Headers = Headers.Builder()
         .add("User-Agent", config[userAgentKey])
         .add("Referer", "$apiScheme://$domain/")
         .add("Origin", "$apiScheme://$domain")
-        .add("Authorization", staticAuth)
         .build()
 
-    private suspend fun createApiHeaders(url: HttpUrl): Headers {
-        val timestamp = (System.currentTimeMillis() / 1000).toString()
-        val message = "wm-api-request"
-        val key = timestamp + "GET" + url.encodedPath + accessKey + secretKey
+    private suspend fun createApiHeaders(): Headers = baseHeaders().newBuilder().apply {
+        getVisitToken()?.let { set("X-WM-Visit", it) }
+    }.build()
 
-        val mac = Mac.getInstance("HmacSHA256")
-        val secretKeySpec = SecretKeySpec(key.toByteArray(Charsets.UTF_8), "HmacSHA256")
-        mac.init(secretKeySpec)
-        val hash = mac.doFinal(message.toByteArray(Charsets.UTF_8))
-        val signature = hash.joinToString("") { "%02x".format(it) }
-
-        return Headers.Builder()
-            .add("User-Agent", config[userAgentKey])
-            .add("Referer", "$apiScheme://$domain/")
-            .add("Origin", "$apiScheme://$domain")
-            .add("Authorization", staticAuth)
-            .add("X-WM-Visit", getVisitToken())
-            .add("x-wm-request-time", timestamp)
-            .add("x-wm-accses-key", accessKey)
-            .add("x-wm-request-signature", signature)
-            .build()
+    private suspend fun apiGet(url: HttpUrl): JSONObject = try {
+        webClient.httpGet(url, createApiHeaders()).parseJson()
+    } catch (e: HttpStatusException) {
+        if (e.statusCode == 403 || e.statusCode == 404) {
+            getVisitToken(forceRefresh = true)
+            webClient.httpGet(url, createApiHeaders()).parseJson()
+        } else {
+            throw e
+        }
     }
 }

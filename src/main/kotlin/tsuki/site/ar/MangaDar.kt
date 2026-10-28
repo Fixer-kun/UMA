@@ -173,8 +173,8 @@ internal class MangaDar(context: MangaLoaderContext) :
                 source = source,
             )
         }.distinctBy { it.url }
-    
-    
+
+
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet("$baseUrl/manga/${manga.url}".toHttpUrl()).parseHtml()
 
@@ -226,7 +226,7 @@ internal class MangaDar(context: MangaLoaderContext) :
                 ?.text()?.takeIf { it.isNotBlank() }
                 ?.let { author = it }
         }
-        
+
         val cover = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("picture img")?.attr("abs:src")?.takeIf { it.isNotBlank() }
@@ -245,7 +245,7 @@ internal class MangaDar(context: MangaLoaderContext) :
             chapters = chapters,
         )
     }
-    
+
     private fun parseChaptersFromDoc(doc: Document, mangaSlug: String): List<MangaChapter> {
         doc.selectFirst("script#mdg-manga-chapters-json")?.let { tag ->
             val raw = tag.data().ifBlank { tag.html() }.trim()
@@ -272,9 +272,9 @@ internal class MangaDar(context: MangaLoaderContext) :
             if (parsed.isNotEmpty()) return parsed
         }
 
-        return parseMadaraChapters(doc, mangaSlug).reversed()
+        return parseMadaraChapters(doc, mangaSlug)
     }
-    
+
     private fun parseRowsJson(rows: JSONArray, mangaSlug: String): List<MangaChapter> {
         val result = mutableListOf<MangaChapter>()
         for (i in 0 until rows.length()) {
@@ -304,7 +304,7 @@ internal class MangaDar(context: MangaLoaderContext) :
         }
         return result
     }
-    
+
     private fun parseMadaraChapters(doc: Document, mangaSlug: String): List<MangaChapter> {
         val result = mutableListOf<MangaChapter>()
         for (li in doc.select("li.wp-manga-chapter")) {
@@ -331,7 +331,7 @@ internal class MangaDar(context: MangaLoaderContext) :
                 source = source,
             )
         }
-        return result
+        return result.reversed()
     }
 
     private fun findMatchingBracket(s: String, startIndex: Int): Int {
@@ -348,7 +348,7 @@ internal class MangaDar(context: MangaLoaderContext) :
         }
         return -1
     }
-    
+
     private fun parseArabicDate(text: String?): Long {
         if (text.isNullOrBlank()) return 0L
         val months = mapOf(
@@ -365,7 +365,7 @@ internal class MangaDar(context: MangaLoaderContext) :
                 .atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli()
         }.getOrDefault(0L)
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val url = if (chapter.url.startsWith("http")) {
             chapter.url.toHttpUrl()
@@ -373,7 +373,7 @@ internal class MangaDar(context: MangaLoaderContext) :
             (baseUrl + chapter.url).toHttpUrl()
         }
         val doc = webClient.httpGet(url).parseHtml()
-        
+
         doc.selectFirst("script[id^=mv-pages-]")?.let { script ->
             val raw = script.data().ifBlank { script.html() }.trim()
             if (raw.isNotEmpty()) {
@@ -392,7 +392,7 @@ internal class MangaDar(context: MangaLoaderContext) :
                 }
             }
         }
-        
+
         return doc.select(".reader-page img").mapIndexedNotNull { index, img ->
             val imageUrl = img.attr("abs:src").ifBlank { img.attr("abs:data-src") }
                 .takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null

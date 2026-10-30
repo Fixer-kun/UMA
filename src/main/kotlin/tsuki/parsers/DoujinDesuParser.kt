@@ -34,6 +34,9 @@ import java.util.EnumSet
 import kotlin.math.abs
 import kotlin.text.iterator
 import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -78,7 +81,7 @@ internal abstract class DoujinDesuParser(
     )
 
     override suspend fun getFilterOptions() = MangaListFilterOptions(
-        availableTags = getOrFetchGenres(),
+        availableTags = getOrFetchGenres() + excludeTypeTags(),
         availableStates = EnumSet.of(
             MangaState.ONGOING,
             MangaState.FINISHED
@@ -138,8 +141,52 @@ internal abstract class DoujinDesuParser(
     private suspend fun refreshCloudflare() {
         webClient.httpGet("https://$domain/", getRequestHeaders()).close()
     }
+    
+    private val excludePrefix = "xtype:"
+    private val allTypes = listOf(ContentType.MANGA, ContentType.DOUJINSHI, ContentType.MANHWA)
+
+    private fun excludeTypeTags(): Set<MangaTag> = allTypes.mapTo(LinkedHashSet()) { type ->
+        MangaTag(
+            key = excludePrefix + type.name,
+            title = "Exclude: " + type.name.lowercase().replaceFirstChar { it.uppercase() },
+            source = source,
+        )
+    }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val excluded = filter.tags
+            .filter { it.key.startsWith(excludePrefix) }
+            .mapNotNull { runCatching { ContentType.valueOf(it.key.removePrefix(excludePrefix)) }.getOrNull() }
+            .toSet()
+        val realTags = filter.tags.filterNot { it.key.startsWith(excludePrefix) }.toSet()
+
+        if (excluded.isEmpty() && filter.types.size <= 1) {
+            return fetchListPage(page, order, filter.copy(tags = realTags))
+        }
+
+        val wanted = (filter.types.ifEmpty { allTypes.toSet() }) - excluded
+        if (wanted.isEmpty()) return emptyList()
+
+        val results = coroutineScope {
+            wanted.map { type ->
+                async { fetchListPage(page, order, filter.copy(types = setOf(type), tags = realTags)) }
+            }.awaitAll()
+        }
+
+        val merged = LinkedHashMap<Long, Manga>()
+        val longest = results.maxOfOrNull { it.size } ?: 0
+        for (i in 0 until longest) {
+            for (list in results) list.getOrNull(i)?.let { merged.putIfAbsent(it.id, it) }
+        }
+        val list = merged.values.toList()
+        return when (order) {
+            SortOrder.ALPHABETICAL -> list.sortedBy { it.title.lowercase() }
+            SortOrder.POPULARITY -> list.sortedByDescending { it.rating }
+            else -> list
+        }
+    }
+
+    private suspend fun fetchListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val limit = pageSize
         val offset = (page - 1) * limit
 

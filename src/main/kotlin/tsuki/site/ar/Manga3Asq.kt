@@ -11,4 +11,6 @@ internal class Manga3Asq(context: MangaLoaderContext) :
     MadaraParser(context, MangaParserSource.MANGA3ASQ, "3asq.online") {
     override val datePattern = "d MMM\u060c yyy"
     override val withoutAjax = true
+    override val chapterAjaxPaginatedParam = "manga-paged"
+    override val chapterAjaxPaginated = true
 }

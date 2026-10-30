@@ -2,43 +2,67 @@ package tsuki.util
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
+import java.util.Base64
 
 /**
- * Extracts and searches embedded data in Next.js HTML pages.
+ * Extracts embedded data from Next.js HTML pages and provides search helpers.
+ * Supports both routing systems.
  *
- * Supports both routing systems:
+ * ## App Router (Next.js 13+)
  *
- * - App Router (Next.js 13+):
- *   Reads Flight data from `self.__next_f.push([1, "..."])` scripts.
- *   Combines escaped strings and parses newline-separated RSC rows,
- *   including JSON objects, arrays, and `T:` text chunks.
- *   RSC references such as `$L`, `$@`, and `$S` are not fully resolved.
+ * Reads the Flight stream from inline `self.__next_f.push(...)` scripts:
+ * - Joins all pushes into one stream first — rows can be split across tags.
+ * - Handles `[1, "text"]` and `[3, "base64"]` push types.
+ * - Parses `<hex-id>:` rows:
+ *     - Text chunks: `T<hexLen>,<content>` (length in UTF-8 bytes).
+ *     - Outlined JSON rows, cached by id.
+ * - Resolves React Flight `$`-references:
+ *     - `$$`                          escaped `$`
+ *     - `$undefined`                  JSON null
+ *     - `$Infinity`, `$NaN`, `$-0`    token without `$`
+ *     - `$D`                          Date (ISO string)
+ *     - `$n`                          BigInt
+ *     - `$Q`                          Map
+ *     - `$W`                          Set
+ *     - `$L`, `$@`                    lazy / promise
+ *     - `$<id>[:<path>]`              outlined model
+ * - Cycles are guarded; unresolved references are left as-is.
  *
- * - Pages Router (Next.js 12 and earlier):
- *   Reads the JSON payload from `__NEXT_DATA__`.
- *   Extracts `props.pageProps` and the root object.
+ * ## Pages Router (Next.js 12 and earlier)
  *
- * Provides helpers to:
- * - Extract top-level JSON payloads.
- * - Find the first matching value using a predicate.
- * - Find objects by key, value, and required properties.
- * - Find arrays, optionally validating their first element.
+ * Reads `<script id="__NEXT_DATA__">` and returns both `props.pageProps` and the
+ * root object. Uses Jsoup so quote style, attributes, and spacing don't matter.
  *
- * Supports inline JSON data and basic RSC Flight parsing,
- * but does not resolve the complete RSC reference graph.
+ * ## Public API
+ *
+ * - [extractPayloads] - all top-level JSON nodes
+ * - [findValue]       - first node matching a predicate
+ * - [findObject]      - first object with a key=value and required keys
+ * - [findArray]       - first non-empty array, optionally validating the head
+ *
+ * App Router is tried first; Pages Router is the fallback.
  */
 object NextJsData {
 
-    private const val NEXT_F_PREFIX = "self.__next_f.push([1,"
+    private const val NEXT_F_PREFIX = "self.__next_f.push("
 
-    /** Returns every top-level JSON node embedded in [html] */
+    /**
+     * Returns every top-level JSON node found in [html], with `$`-references
+     * resolved.
+     */
     fun extractPayloads(html: String): List<Any> {
-        val appRouter = extractFlightPayloads(html)
-        if (appRouter.isNotEmpty()) return appRouter
+        val flight = extractAppRouter(html)
+        if (flight.results.isNotEmpty()) {
+            val resolved = flight.results.mapNotNull { item ->
+                resolve(item, flight.chunks, flight.models)
+            }
+            if (resolved.isNotEmpty()) return resolved
+        }
         return extractNextDataPayloads(html)
     }
 
-    /** Finds the first node anywhere in the payload graph matching [predicate] */
+    /** Finds the first node anywhere in the payload graph that matches [predicate]. */
     fun findValue(html: String, predicate: (Any) -> Boolean): Any? {
         for (payload in extractPayloads(html)) {
             findValueIn(payload, predicate)?.let { return it }
@@ -46,7 +70,7 @@ object NextJsData {
         return null
     }
 
-    /** Finds the first object with `[key] == value` and every [requiredKeys] */
+    /** Finds the first object where `[key] == value` and every [requiredKeys] is present. */
     fun findObject(
         html: String,
         key: String,
@@ -58,7 +82,9 @@ object NextJsData {
                 requiredKeys.all { node.has(it) }
     } as? JSONObject
 
-    /** Finds the first array, optionally validating the first element */
+    /**
+     * Finds the first non-empty array, optionally validating the first element.
+     */
     fun findArray(
         html: String,
         validator: ((JSONObject) -> Boolean)? = null,
@@ -67,98 +93,309 @@ object NextJsData {
                 (validator == null || node.optJSONObject(0)?.let(validator) == true)
     } as? JSONArray
 
-    /** App router */
-    private fun extractFlightPayloads(html: String): List<Any> {
-        val scripts = mutableListOf<String>()
-        var searchFrom = 0
-        while (true) {
-            val marker = html.indexOf(NEXT_F_PREFIX, searchFrom)
-            if (marker == -1) break
+    /** Everything we scraped from the App Router side of the page. */
+    private data class FlightData(
+        /** Top-level JSON rows, in the order they appeared in the stream. */
+        val results: List<Any>,
+        /** Text chunks (`T` rows) keyed by their hex id. */
+        val chunks: Map<String, String>,
+        /** Outlined JSON rows keyed by their hex id. */
+        val models: Map<String, Any>,
+    )
 
-            var i = marker + NEXT_F_PREFIX.length
-            if (i >= html.length || html[i] != '"') { searchFrom = i; continue }
-            i++
-            val start = i
-            var escaped = false
-            var end = -1
-            while (i < html.length) {
-                val c = html[i]
-                when {
-                    escaped -> escaped = false
-                    c == '\\' -> escaped = true
-                    c == '"' -> { end = i; break }
+    /**
+     * Walks every inline `<script>`, finds the `self.__next_f.push(...)` calls, joins
+     * their payloads into one big stream, and parses that.
+     */
+    private fun extractAppRouter(html: String): FlightData {
+        val doc = Jsoup.parse(html)
+        val stream = StringBuilder()
+
+        for (script in doc.select("script:not([src])")) {
+            val data = script.data()
+            if (data.isEmpty() || !data.contains(NEXT_F_PREFIX)) continue
+
+            var from = 0
+            while (true) {
+                val idx = data.indexOf(NEXT_F_PREFIX, from)
+                if (idx == -1) break
+                val openBracket = data.indexOf('[', idx)
+                if (openBracket == -1) { from = idx + 1; continue }
+
+                val (arr, end) = parseJsonArrayAt(data, openBracket)
+                from = end
+                if (arr == null) continue
+
+                try {
+                    val type = arr.optInt(0)
+                    val content = arr.optString(1)
+                    when (type) {
+                        1 -> stream.append(content) // plain text slice
+                        3 -> runCatching {
+                            stream.append(String(Base64.getDecoder().decode(content), Charsets.UTF_8)) // base64-encoded bytes
+                        }
+                    }
+                } catch (_: Exception) {
                 }
-                i++
             }
-            if (end == -1) break
-            scripts += html.substring(start, end).unescapeJson()
-            searchFrom = end + 1
         }
-        return scripts.flatMap { extractRscRows(it) }
+
+        return parseRscRows(stream.toString())
     }
 
-    private fun extractRscRows(body: String): List<Any> {
+    /**
+     * Turns the joined RSC stream into top-level rows plus the chunk and model
+     * caches used later to resolve `$`-references.
+     *
+     * Rows look roughly like:
+     *   `<hex-id>:<json>`                  outlined model row
+     *   `<hex-id>:T<hexLen>,<content>`     text chunk
+     */
+    private fun parseRscRows(body: String): FlightData {
+        val chunks = mutableMapOf<String, String>()
+        val models = mutableMapOf<String, Any>()
         val results = mutableListOf<Any>()
+
         var pos = 0
         while (pos < body.length) {
+            // Look for the next "<hex-id>:" header.
             val colon = body.indexOf(':', pos)
             if (colon == -1) break
-
             val id = body.substring(pos, colon)
-            if (id.isEmpty() || !id.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
-                pos++; continue
+            if (id.isEmpty() || !id.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+                // Not actually a row header, nudge forward and keep looking.
+                pos++
+                continue
             }
 
             pos = colon + 1
             if (pos >= body.length) break
 
             if (body[pos] == 'T') {
+                // Text chunk: T<hexLen>,<content>
                 pos++
                 val comma = body.indexOf(',', pos)
                 if (comma == -1) break
                 val byteLen = body.substring(pos, comma).toIntOrNull(16) ?: break
                 pos = comma + 1
+
                 var bytes = 0
                 val start = pos
                 while (pos < body.length && bytes < byteLen) {
                     bytes += when {
                         body[pos].code < 0x80 -> 1
                         body[pos].code < 0x800 -> 2
-                        Character.isHighSurrogate(body[pos]) -> { pos++; 4 }
+                        Character.isHighSurrogate(body[pos]) -> { pos++; 4 }   // consume the pair
                         else -> 3
                     }
                     pos++
                 }
-                runCatching { parseJson(body.substring(start, pos)) }
-                    .getOrNull()?.let { results += it }
+
+                val text = body.substring(start, pos)
+                chunks[id] = text
+
+                runCatching {
+                    val t = text.trim()
+                    if (t.startsWith("{")) results.add(JSONObject(t))
+                    else if (t.startsWith("[")) results.add(JSONArray(t))
+                }
             } else {
                 val (element, end) = parseJsonAt(body, pos)
-                element?.let { results += it }
+                if (element != null) {
+                    results.add(element)
+                    models[id] = element
+                }
                 pos = end
             }
         }
-        return results
+
+        return FlightData(results, chunks, models)
     }
 
-    /** Pages router */
+    /**
+     * Grabs the Pages Router `__NEXT_DATA__` payload, if the page has one.
+     *
+     * Uses Jsoup rather than searching for the literal string, so we don't break on
+     * different quote styles, extra attributes, or whitespace inside the tag.
+     */
     private fun extractNextDataPayloads(html: String): List<Any> {
-        val marker = "id=\"__NEXT_DATA__\""
-        val idx = html.indexOf(marker)
-        if (idx == -1) return emptyList()
-        val start = html.indexOf('>', idx) + 1
-        if (start <= 0) return emptyList()
-        val end = html.indexOf("</script>", start)
-        if (end == -1) return emptyList()
+        val doc = Jsoup.parse(html)
+        val script = doc.selectFirst("script#__NEXT_DATA__") ?: return emptyList()
+        val data = script.data().trim()
+        if (data.isEmpty()) return emptyList()
         return runCatching {
-            val root = JSONObject(html.substring(start, end).trim())
-            listOfNotNull(
-                root.optJSONObject("props")?.optJSONObject("pageProps"),
-                root,
-            )
+            val root = JSONObject(data)
+            listOfNotNull(root.optJSONObject("props")?.optJSONObject("pageProps"), root)
         }.getOrDefault(emptyList())
     }
 
-    /** Helper */
+    /**
+     * Walks [node] recursively and replaces every Flight `$`-reference with whatever
+     * it points at. References we can't resolve are left alone as their original
+     * strings.
+     *
+     * [resolving] keeps track of ids we're currently expanding so a model that points
+     * at itself (or two models that point at each other) can't loop forever.
+     */
+    private fun resolve(
+        node: Any?,
+        chunks: Map<String, String>,
+        models: Map<String, Any>,
+        resolving: Set<String> = emptySet(),
+    ): Any? = when (node) {
+        is JSONObject -> JSONObject().also { out ->
+            val keys = node.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                out.put(k, resolve(node.opt(k), chunks, models, resolving) ?: JSONObject.NULL)
+            }
+        }
+        is JSONArray -> JSONArray().also { out ->
+            for (i in 0 until node.length()) {
+                out.put(resolve(node.opt(i), chunks, models, resolving) ?: JSONObject.NULL)
+            }
+        }
+        is String -> resolveString(node, chunks, models, resolving)
+        else -> node
+    }
+
+    /**
+     * Hands a single `$`-prefixed string off to the right handler.
+     *
+     * Returning `null` here means "couldn't resolve" and we deliberately fall back
+     * to the original string in that case so callers can still see it.
+     */
+    private fun resolveString(
+        s: String,
+        chunks: Map<String, String>,
+        models: Map<String, Any>,
+        resolving: Set<String>,
+    ): Any {
+        if (!s.startsWith("$") || s.length < 2) return s
+        return when {
+            s == "\$undefined" -> JSONObject.NULL
+            // JSON can't hold Infinity / NaN / -0 as numbers, so we strip the `$` and
+            // let the caller decide how to parse the raw token.
+            s == "\$Infinity" || s == "\$-Infinity" || s == "\$NaN" || s == "\$-0" -> s.substring(1)
+            s[1] == '$' -> s.substring(1)                 // $$ → escaped '$'
+            s[1] == 'D' -> s.substring(2)                 // $D<iso> → ISO date string
+            s[1] == 'n' -> s.substring(2)                 // $n<digits> → BigInt string
+            s[1] == 'Q' -> resolveMapRef(s.substring(2), chunks, models, resolving)
+            s[1] == 'W' -> resolveSetRef(s.substring(2), chunks, models, resolving)
+            s[1] == 'L' || s[1] == '@' -> resolveModelRef(s.substring(2), chunks, models, resolving)
+            else -> resolveModelRef(s.substring(1), chunks, models, resolving)
+        } ?: s
+    }
+
+    /**
+     * Resolves `$<id>` or `$<id>:<seg>:<seg>...` by looking up `<id>` in the text
+     * chunks first, then in the model cache, and walking any `:<seg>` pieces into
+     * the result.
+     *
+     * - Bare `$<id>` prefers a text chunk if one exists under that id.
+     * - `<id>:<seg>...` starts from the model cache and walks each segment. If the
+     *   current value is itself a `$`-reference (this happens with lazily-outlined
+     *   sub-paths), we resolve it before applying the next segment.
+     *
+     * Returns `null` if the reference can't be resolved, the caller then falls back
+     * to the raw string.
+     */
+    private fun resolveModelRef(
+        reference: String,
+        chunks: Map<String, String>,
+        models: Map<String, Any>,
+        resolving: Set<String>,
+    ): Any? {
+        val segments = reference.split(':')
+        val id = segments[0]
+
+        if (segments.size == 1) {
+            chunks[id]?.let { return it }
+        }
+        if (id in resolving) return null // cycle guard
+        val guard = resolving + id
+
+        var value: Any = models[id] ?: return null
+        for (i in 1 until segments.size) {
+            if (value is String && value.startsWith("$")) {
+                value = resolve(value, chunks, models, guard) ?: return null
+            }
+            value = walkRefSegment(value, segments[i]) ?: return null
+        }
+        return resolve(value, chunks, models, guard)
+    }
+
+    /**
+     * Indexes [value] by one path [segment].
+     *
+     * React elements come over the wire as `["$", type, key, props]` tuples, and the
+     * client turns them into objects with named fields. We mimic that here so paths
+     * like `$id:props:children` do what you'd expect. Plain objects index by key,
+     * plain arrays by numeric index.
+     */
+    private fun walkRefSegment(value: Any, segment: String): Any? = when (value) {
+        is JSONObject -> if (value.has(segment)) value.opt(segment) else null
+        is JSONArray -> {
+            val isTuple = value.length() >= 4 && value.optString(0) == "$"
+            when {
+                isTuple && segment == "type" -> value.opt(1)
+                isTuple && segment == "key" -> value.opt(2)
+                isTuple && segment == "props" -> value.opt(3)
+                else -> segment.toIntOrNull()?.let {
+                    if (it in 0 until value.length()) value.opt(it) else null
+                }
+            }
+        }
+        else -> null
+    }
+
+    /**
+     * `$Q<id>` Map. The model at [id] is an array of `[key, value]` pairs; resolve
+     * it and turn the pairs into a single object. Anything that isn't a 2-element
+     * array gets skipped.
+     */
+    private fun resolveMapRef(
+        id: String,
+        chunks: Map<String, String>,
+        models: Map<String, Any>,
+        resolving: Set<String>,
+    ): Any? {
+        if (id in resolving) return null
+        val entries = models[id] as? JSONArray ?: return null
+        val resolved = resolve(entries, chunks, models, resolving + id) as? JSONArray ?: return null
+        return JSONObject().also { out ->
+            for (i in 0 until resolved.length()) {
+                val pair = resolved.optJSONArray(i) ?: continue
+                if (pair.length() != 2) continue
+                out.put(pair.optString(0), pair.opt(1))
+            }
+        }
+    }
+
+    /**
+     * `$W<id>` Set. The model at [id] is an array of values; we resolve it and
+     * return it. JSON has no Set type so an array is the closest we can get.
+     */
+    private fun resolveSetRef(
+        id: String,
+        chunks: Map<String, String>,
+        models: Map<String, Any>,
+        resolving: Set<String>,
+    ): Any? {
+        if (id in resolving) return null
+        val values = models[id] as? JSONArray ?: return null
+        return resolve(values, chunks, models, resolving + id)
+    }
+
+    /**
+     * Depth-first search: returns the first node in [node] (including [node] itself)
+     * that satisfies [predicate]. Descends through [JSONObject] values and
+     * [JSONArray] elements, nothing else.
+     *
+     * The "nothing else" part is load-bearing: if results ever contain a plain
+     * `List` or `Collection`, this function won't see inside it, so we always keep
+     * arrays as [JSONArray].
+     */
     private fun findValueIn(node: Any, predicate: (Any) -> Boolean): Any? {
         if (predicate(node)) return node
         when (node) {
@@ -179,15 +416,12 @@ object NextJsData {
         return null
     }
 
-    private fun parseJson(text: String): Any {
-        val t = text.trim()
-        return when {
-            t.startsWith("{") -> JSONObject(t)
-            t.startsWith("[") -> JSONArray(t)
-            else -> throw IllegalArgumentException("Not JSON")
-        }
-    }
-
+    /**
+     * Parses one JSON value starting at [start] in [body] and returns it alongside
+     * the position right after it (or the last position we consumed, if parsing
+     * failed). Handles bracketed objects/arrays and bare scalars (which end at the
+     * first whitespace).
+     */
     private fun parseJsonAt(body: String, start: Int): Pair<Any?, Int> {
         if (start >= body.length) return null to start
         var depth = 0
@@ -213,30 +447,52 @@ object NextJsData {
         return null to i
     }
 
-    private fun String.unescapeJson(): String {
-        val sb = StringBuilder(length)
-        var i = 0
-        while (i < length) {
-            val c = this[i]
-            if (c == '\\' && i + 1 < length) {
-                when (this[i + 1]) {
-                    '"' -> { sb.append('"'); i += 2 }
-                    '\\' -> { sb.append('\\'); i += 2 }
-                    '/' -> { sb.append('/'); i += 2 }
-                    'b' -> { sb.append('\b'); i += 2 }
-                    'f' -> { sb.append('\u000C'); i += 2 }
-                    'n' -> { sb.append('\n'); i += 2 }
-                    'r' -> { sb.append('\r'); i += 2 }
-                    't' -> { sb.append('\t'); i += 2 }
-                    'u' -> {
-                        val code = if (i + 5 < length) substring(i + 2, i + 6).toIntOrNull(16) else null
-                        if (code != null) { sb.append(code.toChar()); i += 6 }
-                        else { sb.append(c); i++ }
-                    }
-                    else -> { sb.append(c); i++ }
-                }
-            } else { sb.append(c); i++ }
+    /** Parses a JSON object or array, anything else is rejected. */
+    private fun parseJson(text: String): Any {
+        val t = text.trim()
+        return when {
+            t.startsWith("{") -> JSONObject(t)
+            t.startsWith("[") -> JSONArray(t)
+            else -> throw IllegalArgumentException("Not JSON")
         }
-        return sb.toString()
+    }
+
+    /**
+     * Parses a JSON array starting at [start] in [s] and returns it alongside the
+     * position right after the closing `]`. Returns `(null, start)` if there's no
+     * array at that spot, and `(null, end-of-input)` if the array never closes.
+     *
+     * Used by [extractAppRouter] to find where each `self.__next_f.push([...])`
+     * argument ends, so we don't need a regex (the regex version blew up on
+     * `DOT_MATCHES_ALL` with multi-megabyte scripts).
+     */
+    private fun parseJsonArrayAt(s: String, start: Int): Pair<JSONArray?, Int> {
+        if (start >= s.length || s[start] != '[') return null to start
+        var depth = 0
+        var inString = false
+        var escape = false
+        var i = start
+        while (i < s.length) {
+            val c = s[i]
+            if (escape) { escape = false; i++; continue }
+            if (inString) {
+                if (c == '\\') escape = true
+                else if (c == '"') inString = false
+            } else {
+                when (c) {
+                    '"' -> inString = true
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) {
+                            val arr = runCatching { JSONArray(s.substring(start, i + 1)) }.getOrNull()
+                            return arr to (i + 1)
+                        }
+                    }
+                }
+            }
+            i++
+        }
+        return null to i
     }
 }

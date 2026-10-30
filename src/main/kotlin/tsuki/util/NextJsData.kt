@@ -36,10 +36,11 @@ import java.util.Base64
  *
  * ## Public API
  *
- * - [extractPayloads] - all top-level JSON nodes
- * - [findValue]       - first node matching a predicate
- * - [findObject]      - first object with a key=value and required keys
- * - [findArray]       - first non-empty array, optionally validating the head
+ * - [extractPayloads]   - all top-level JSON nodes
+ * - [findValue]         - first node matching a predicate
+ * - [findObject]        - first object with a key=value and required keys
+ * - [findArray]         - first non-empty array, optionally validating the head
+ * - [findLargestArray]  - biggest matching array across all payloads
  *
  * App Router is tried first; Pages Router is the fallback.
  */
@@ -92,6 +93,66 @@ object NextJsData {
         node is JSONArray && node.length() > 0 &&
                 (validator == null || node.optJSONObject(0)?.let(validator) == true)
     } as? JSONArray
+
+    /**
+     * Finds the **largest** non-empty array across every payload, optionally
+     * validating the first element.
+     *
+     * Use this instead of [findArray] when a page can embed several arrays of
+     * the same shape with very different sizes and the big one is the one you
+     * actually want.
+     *
+     * Typical case: a sidebar or "trending" block near the top
+     * of the stream carries a handful of small arrays (2–3 items each) with
+     * the exact same element shape as the main list (100+ items) further down,
+     * so [findArray]'s first-match behavior returns one of the small ones.
+     *
+     * Ties are broken by first-seen order, matching [findArray]'s behavior.
+     */
+    fun findLargestArray(
+        html: String,
+        validator: ((JSONObject) -> Boolean)? = null,
+    ): JSONArray? {
+        var best: JSONArray? = null
+        for (payload in extractPayloads(html)) {
+            collectMatchingArrays(payload, validator) { arr ->
+                if (best == null || arr.length() > best!!.length()) best = arr
+            }
+        }
+        return best
+    }
+
+    /**
+     * Depth-first walk over [node] calling [action] for every array whose first
+     * element passes [validator] (or every non-empty array when [validator] is
+     * `null`). Descends through [JSONObject] values and [JSONArray] elements —
+     * same traversal rules as [findValueIn], so the `JSONArray`-only invariant
+     * still holds.
+     */
+    private fun collectMatchingArrays(
+        node: Any,
+        validator: ((JSONObject) -> Boolean)?,
+        action: (JSONArray) -> Unit,
+    ) {
+        when (node) {
+            is JSONObject -> {
+                val keys = node.keys()
+                while (keys.hasNext()) {
+                    collectMatchingArrays(node.opt(keys.next()) ?: continue, validator, action)
+                }
+            }
+            is JSONArray -> {
+                if (node.length() > 0 &&
+                    (validator == null || node.optJSONObject(0)?.let(validator) == true)
+                ) {
+                    action(node)
+                }
+                for (i in 0 until node.length()) {
+                    collectMatchingArrays(node.opt(i) ?: continue, validator, action)
+                }
+            }
+        }
+    }
 
     /** Everything we scraped from the App Router side of the page. */
     private data class FlightData(

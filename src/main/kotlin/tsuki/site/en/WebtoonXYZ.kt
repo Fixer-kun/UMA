@@ -14,6 +14,7 @@ internal class WebtoonXYZ(context: MangaLoaderContext):
     override val datePattern = "dd MMMM yyyy"
 
     override val listUrl = "webtoons/"
+    override val tagPrefix = "webtoon-genre/"
 
     private val thumbnailRegex = Regex("-\\d+x\\d+(\\.[a-zA-Z]+)$")
 

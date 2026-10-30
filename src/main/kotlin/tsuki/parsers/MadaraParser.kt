@@ -86,24 +86,43 @@ internal abstract class MadaraParser(
 
     /**
      * AJAX listing mode.
-     *  false (default) – uses POST requests to wp-admin/admin-ajax.php
-     *  true            – builds normal GET URLs (?s=, ?page=, /manga-genre/…) and parses the HTML directly.
+     *  false (default) - uses POST requests to wp-admin/admin-ajax.php
+     *  true            - builds normal GET URLs (?s=, ?page=, /manga-genre/…) and parses the HTML directly.
      */
     protected open val withoutAjax = false
     protected open val authorSearchSupported = false
+
+    /**
+     * Chapter list pagination.
+     *
+     *  false (default) - single request, returns the whole chapter list.
+     *  true            - loop `page=1,2,3...` on the AJAX endpoint until
+     *                    the response is empty or stops returning new URLs.
+     *
+     * Works with both transport styles:
+     *   postReq = true  -> admin-ajax.php?action=manga_get_chapters&manga=<id>&<param>=<page>
+     *   postReq = false -> /manga/<slug>/ajax/chapters/?t=<page>
+     */
+    protected open val chapterAjaxPaginated: Boolean = false
+
+    /** Query param used for admin-ajax pagination (postReq = true). */
+    protected open val chapterAjaxPaginatedParam: String = "paged"
+
+    /** URL suffix used for slug-ajax pagination (postReq = false). */
+    protected open val chapterAjaxPaginatedUrlSuffix: String = "/ajax/chapters/?t="
 
     /** Date format pattern used to parse chapter release dates (SimpleDateFormat). */
     protected open val datePattern = "MMMM d, yyyy"
 
     /**
      * Genre fetching:
-     *  listUrl   – the page path (relative to domain) that contains the genre list.
+     *  listUrl   - the page path (relative to domain) that contains the genre list.
      *              The parser fetches https://domain/<listUrl> to scrape available genres.
      *
-     *  tagPrefix – the URL segment that immediately precedes the genre identifier in filter links.
+     *  tagPrefix - the URL segment that immediately precedes the genre identifier in filter links.
      *              Used to extract the genre key from a link like /manga-genre/action/ -> "action".
      *
-     *  extractGenreKey – converts the href of a genre link into the key stored on [MangaTag].
+     *  extractGenreKey - converts the href of a genre link into the key stored on [MangaTag].
      *                    Default strips everything before [tagPrefix] and trims the trailing slash.
      *                    Override when the genre is encoded in the query string
      *                    (e.g. ?genre=action -> "action") or under a different path segment.
@@ -120,11 +139,11 @@ internal abstract class MadaraParser(
 
     /**
      * Chapter list handling:
-     *  stylePage – suffix appended to chapter URLs to force all images to be shown in one long list.
-     *  postReq   – whether to use the old AJAX endpoint for chapter loading.
+     *  stylePage - suffix appended to chapter URLs to force all images to be shown in one long list.
+     *  postReq   - whether to use the old AJAX endpoint for chapter loading.
      *      true  -> POST admin-ajax.php with action=manga_get_chapters&manga=<id>
      *      false -> POST /manga/<slug>/ajax/chapters/ with empty body
-     *  postDataReq – form data used when postReq = true.
+     *  postDataReq - form data used when postReq = true.
      */
     protected open val stylePage = "?style=list"
     protected open val postReq = false
@@ -696,6 +715,13 @@ internal abstract class MadaraParser(
     }
 
     protected open suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> {
+        if (chapterAjaxPaginated) {
+            val fullUrl = doc.selectFirst("head meta[property='og:url']")
+                ?.attr("content")
+                ?: manga.url.toAbsoluteUrl(domain)
+            return fetchPaginatedChapters(fullUrl, doc)
+        }
+
         val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
         return doc.body().select(selectChapter).mapChapters(reversed = true) { _, li ->
             val a = li.selectFirstOrThrow("a")
@@ -719,6 +745,10 @@ internal abstract class MadaraParser(
     }
 
     protected open suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
+        if (chapterAjaxPaginated) {
+            return fetchPaginatedChapters(mangaUrl.toAbsoluteUrl(domain), document)
+        }
+
         val doc = if (postReq) {
             val mangaId = document.select("div#manga-chapters-holder").attr("data-id")
             val url = "https://$domain/wp-admin/admin-ajax.php"
@@ -730,6 +760,92 @@ internal abstract class MadaraParser(
         }
         val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
         return doc.select(selectChapter).mapChapters(reversed = true) { _, li ->
+            val a = li.selectFirstOrThrow("a")
+            val href = a.attrAsRelativeUrl("href")
+            val link = href + stylePage
+            val dateText = li.selectFirst("a.c-new-tag")?.attr("title") ?: li.selectFirst(selectDate)?.text()
+            val baseName = a.selectFirst("p")?.text() ?: a.ownText()
+            val name = transformChapterName(li, baseName)
+            MangaChapter(
+                id = generateUid(href),
+                url = link,
+                title = name,
+                number = name.extractChapterNumber(),
+                volume = 0,
+                branch = null,
+                uploadDate = parseChapterDate(dateFormat, dateText),
+                scanlator = null,
+                source = source,
+            )
+        }
+    }
+
+    /**
+     * Paginated chapter fetch shared by [getChapters] and [loadChapters].
+     *
+     * Because the details HTML usually already contains the first N chapters,
+     * we seed the result with those inline chapters, then loop page 1, 2, 3…
+     * on the AJAX endpoint:
+     *
+     *  - Each AJAX page is parsed with the current page's last href tracked.
+     *  - If a page returns no `<li>` at all → we're past the end, stop.
+     *  - If a page returns the exact same last-href as the previous page →
+     *    the site is ignoring the page param, stop.
+     *  - Inline chapters are added to the result but never used to stop the
+     *    loop: page 1 of AJAX is often a duplicate of inline, and stopping
+     *    there would skip page 2+.
+     */
+    private suspend fun fetchPaginatedChapters(mangaUrl: String, document: Document): List<MangaChapter> {
+        val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
+        val allElements = mutableListOf<Element>()
+        val seenHrefs = HashSet<String>()
+
+        // Seed with the chapters that are already inline.
+        document.select(selectChapter).forEach { li ->
+            val href = li.selectFirstOrThrow("a").attrAsRelativeUrl("href")
+            if (href.isNotEmpty() && seenHrefs.add(href)) {
+                allElements.add(li)
+            }
+        }
+
+        val mangaId = document.select("div#manga-chapters-holder").attr("data-id")
+
+        var lastAjaxPageHref: String? = null
+        var page = 1
+        while (page <= 100) {
+            val doc = try {
+                if (postReq) {
+                    val postData = "${postDataReq}$mangaId&$chapterAjaxPaginatedParam=$page"
+                    webClient.httpPost("https://$domain/wp-admin/admin-ajax.php", postData).parseHtml()
+                } else {
+                    val url = "${mangaUrl.removeSuffix('/')}$chapterAjaxPaginatedUrlSuffix$page"
+                    webClient.httpPost(url, emptyMap()).parseHtml()
+                }
+            } catch (_: Exception) {
+                break
+            }
+
+            val lis = doc.select(selectChapter)
+            if (lis.isEmpty()) break
+
+            val pageLastHref = lis.last()
+                ?.selectFirstOrThrow("a")
+                ?.attrAsRelativeUrl("href")
+
+            // Site ignored the param — every page comes back identical.
+            if (pageLastHref == lastAjaxPageHref) break
+            lastAjaxPageHref = pageLastHref
+
+            lis.forEach { li ->
+                val href = li.selectFirstOrThrow("a").attrAsRelativeUrl("href")
+                if (href.isNotEmpty() && seenHrefs.add(href)) {
+                    allElements.add(li)
+                }
+            }
+            page++
+        }
+
+        return allElements.mapChapters(reversed = true) { _, li ->
             val a = li.selectFirstOrThrow("a")
             val href = a.attrAsRelativeUrl("href")
             val link = href + stylePage

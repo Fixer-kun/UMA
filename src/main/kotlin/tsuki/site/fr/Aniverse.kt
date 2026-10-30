@@ -87,7 +87,7 @@ internal class Aniverse(context: MangaLoaderContext) :
             ContentType.ONE_SHOT,
         ),
     )
-    
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val isCatalogue = order == SortOrder.UPDATED && filter.query.isNullOrBlank() &&
                 filter.tags.size <= 1 && filter.states.isEmpty() && filter.types.isEmpty()
@@ -161,22 +161,19 @@ internal class Aniverse(context: MangaLoaderContext) :
             source = source,
         )
     }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val (slug, html) = loadMangaPage(manga)
         val pageUrl = "https://$domain/manga/$slug"
 
-        val obj = NextJsData.findObject(
-            html = html,
-            key = "slug",
-            value = slug,
-            "databaseId",
-            "genres",
-        ) ?: throw ParseException("Manga data not found", pageUrl)
+        val obj = NextJsData.findObject(html, "slug", slug, "databaseId", "genres")
+            ?: throw ParseException("Manga data not found", pageUrl)
 
-        val chapters = NextJsData.findArray(html) { first ->
-            first.has("id") && first.has("number")
-        }?.takeIf { it.length() > 0 }
+        val chapters = obj.optJSONArray("chapters")
+            ?.takeIf { it.length() > 0 }
+            ?: NextJsData.findLargestArray(html) { first ->
+                first.has("id") && first.has("number")
+            }
             ?: fetchChaptersFromReader(slug, obj.getString("databaseId"))
 
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
@@ -217,7 +214,7 @@ internal class Aniverse(context: MangaLoaderContext) :
             ),
         )
     }
-    
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val segments = chapter.url.split('/').filter { it.isNotEmpty() }
         if (segments.size < 3) throw ParseException("Invalid chapter url", chapter.url)
@@ -231,7 +228,7 @@ internal class Aniverse(context: MangaLoaderContext) :
                 )
             }
     }
-    
+
     private suspend fun fetchReader(slug: String, chapterId: String): JSONObject {
         val url = urlBuilder()
             .addPathSegments("api/manga/reader")

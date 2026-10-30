@@ -133,7 +133,7 @@ internal class PoseidonScans(context: MangaLoaderContext) :
             filter.query?.takeIf { it.isNotBlank() }?.let {
                 addQueryParameter("search", it.trim())
             }
-            
+
             val tagValues = mutableListOf<String>()
             filter.types.forEach { type ->
                 when (type) {
@@ -307,8 +307,7 @@ internal class PoseidonScans(context: MangaLoaderContext) :
                             ch.optString("title").contains("volume", ignoreCase = true))
 
             val baseName = if (isVolume) "Volume $numberString" else "Chapitre $numberString"
-            val rawTitle = ch.optString("title").takeIf { it.isNotBlank() }
-
+            val rawTitle = ch.optString("title").takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
             val displayName = buildString {
                 if (isLocked) append("🔒 ")
                 append(baseName)

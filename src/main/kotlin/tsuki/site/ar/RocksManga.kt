@@ -213,7 +213,7 @@ internal class RocksManga(context: MangaLoaderContext) :
             contentRating = null,
         )
     }
-    
+
     override suspend fun getDetails(manga: Manga): Manga {
         val fullUrl = "https://$domain${manga.url}".toHttpUrl()
         val doc = webClient.httpGet(fullUrl).parseHtml()
@@ -379,7 +379,7 @@ internal class RocksManga(context: MangaLoaderContext) :
             val href = "/manga/$mangaSlug/chapter/$number"
 
             val rawTitle = c.optString("title").takeIf { it.isNotBlank() && it != "null" }
-            val displayTitle = if (rawTitle == null) "Chapter $number" else "$rawTitle - Chapter $number"
+            val displayTitle = if (rawTitle == null) "Chapter $number" else "Chapter $number - $rawTitle"
 
             val scanlator = c.optJSONObject("uploader")
                 ?.optString("display_name")
@@ -399,7 +399,7 @@ internal class RocksManga(context: MangaLoaderContext) :
         }
         return result.sortedBy { it.number }
     }
-
+    
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = "https://$domain${chapter.url}".toHttpUrl()
         val doc = webClient.httpGet(fullUrl).parseHtml()
@@ -453,7 +453,7 @@ internal class RocksManga(context: MangaLoaderContext) :
                 MangaPage(id = generateUid(src), url = src, preview = null, source = source)
             }
     }
-    
+
     private fun absApiUrl(path: String): String = when {
         path.startsWith("http://", ignoreCase = true) ||
                 path.startsWith("https://", ignoreCase = true) -> path

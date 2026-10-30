@@ -21,11 +21,11 @@ import tsuki.model.SortOrder
 
 import tsuki.util.NextJsData
 import tsuki.util.generateUid
+import tsuki.util.getTurnstileToken
 import tsuki.util.parseJson
 import tsuki.util.parseRaw
 import tsuki.util.urlEncoded
 
-import okhttp3.Call
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -43,6 +43,8 @@ import java.util.EnumSet
 import java.util.Locale
 import java.util.TimeZone
 
+import tsuki.Broken
+@Broken("chapter images doenst work")
 @MangaSourceParser("PROCOMIC", "ProComic", "ar")
 internal class ProComic(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.PROCOMIC, 50) {
@@ -51,20 +53,6 @@ internal class ProComic(context: MangaLoaderContext) :
 
     private val baseUrl get() = "https://$domain"
     private val siteHost get() = domain
-
-    private val showLockedKey = ConfigKey.PreferredImageServer(
-        presetValues = mapOf(
-            "false" to "Hide locked",
-            "true" to "Show locked",
-        ),
-        defaultValue = "false",
-    )
-    private val showLocked: Boolean get() = config[showLockedKey] == "true"
-
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(showLockedKey)
-    }
 
     override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
         .set("Referer", "$baseUrl/")
@@ -310,7 +298,7 @@ internal class ProComic(context: MangaLoaderContext) :
             for (i in 0 until data.length()) {
                 val ch = data.optJSONObject(i) ?: continue
                 if (ch.optString("language") != "AR") continue
-                if (!showLocked && isLocked(ch)) continue
+                if (isLocked(ch)) continue
                 chapters.add(parseChapter(ch, slug, mangaId))
             }
             if (chapters.size >= total) break
@@ -339,10 +327,8 @@ internal class ProComic(context: MangaLoaderContext) :
         val uploadDate = runCatching {
             dateFormat.parse(publishedAt.take(19))?.time ?: 0L
         }.getOrDefault(0L)
-        val locked = isLocked(ch)
 
         val displayName = buildString {
-            if (locked) append("🔒 ")
             append("الفصل ").append(number)
             title?.let { append(" - ").append(it) }
         }
@@ -367,17 +353,14 @@ internal class ProComic(context: MangaLoaderContext) :
         val chapterId = parts[1].toIntOrNull() ?: return emptyList()
         val slug = parts[2]
         val number = parts[3]
+        val chapterUrl = "https://$domain/ar/chapter/$slug-$number-$chapterId"
 
-        val readerUrl = "https://$domain/ar/chapter/$slug-$number-$chapterId"
         val html = runCatching {
-            webClient.httpGet(readerUrl, htmlHeaders()).parseRaw()
+            webClient.httpGet(chapterUrl, htmlHeaders()).parseRaw()
         }.getOrNull() ?: return emptyList()
 
         val reader = NextJsData.findValue(html) { node ->
-            node is JSONObject &&
-                    node.has("chapterId") &&
-                    node.has("appImages") &&
-                    node.has("deferredMedia")
+            node is JSONObject && node.has("chapterId") && node.has("appImages")
         } as? JSONObject ?: return emptyList()
 
         val readerChapterId = reader.optInt("chapterId", chapterId)
@@ -386,27 +369,44 @@ internal class ProComic(context: MangaLoaderContext) :
         val images = mutableListOf<String>()
         reader.optJSONArray("appImages")?.let { arr ->
             for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val url = obj.optString("mobile").ifBlank { obj.optString("desktop") }
-                if (url.isNotBlank()) images.add(url)
+                arr.optJSONObject(i)?.let { obj ->
+                    val url = obj.optString("mobile").ifBlank { obj.optString("desktop") }
+                    if (url.isNotBlank()) images.add(url)
+                }
             }
         }
 
-        val deferredImages = mutableListOf<String>()
-        val mapRequests = mutableListOf<String>()
+        var pass: String?
+        val deferred = reader.optJSONObject("deferredMedia")
+        if (deferred != null) {
+            val token = deferred.optString("token")
+            val requireTurnstile = deferred.optBoolean("requireTurnstile")
+            val turnstileMode = deferred.optString("turnstileMode")
 
-        val deferredToken = reader.optJSONObject("deferredMedia")?.optString("token").orEmpty()
-        if (deferredToken.isNotBlank()) {
-            val deferredUrl =
-                "https://$domain/chapter-deferred-media/$readerChapterId?token=${deferredToken.urlEncoded()}"
+            val headersBuilder = getRequestHeaders().newBuilder()
+            if (requireTurnstile) {
+                // Only fetch the login widget's key when the site explicitly asks for "visible".
+                val loginKey = if (turnstileMode == "visible") loginTurnstileKey() else null
+                val siteKey = loginKey ?: TURNSTILE_SITE_KEY
+                val widget = if (loginKey != null) "login" else "reader"
+                val turnstileToken = getTurnstileToken(context, chapterUrl, siteKey)
+                headersBuilder["x-turnstile-token"] = turnstileToken
+                headersBuilder["x-turnstile-widget"] = widget
+            }
+
+            val deferredUrl = "$baseUrl/chapter-deferred-media/$readerChapterId?token=${token.urlEncoded()}"
             val response = runCatching {
-                webClient.httpGet(deferredUrl, getRequestHeaders()).parseJson()
+                webClient.httpGet(deferredUrl, headersBuilder.build()).parseJson()
             }.getOrNull()
 
             response?.optJSONObject("data")?.let { data ->
+                pass = data.optString("pass").takeIf { it.isNotBlank() }
+
                 data.optJSONArray("images")?.let { arr ->
                     for (i in 0 until arr.length()) {
-                        arr.optString(i).takeIf { it.isNotBlank() }?.let(deferredImages::add)
+                        arr.optString(i).takeIf { it.isNotBlank() }?.let {
+                            images.add(signedProxyUrl(it, pass))
+                        }
                     }
                 }
                 data.optJSONArray("maps")?.let { arr ->
@@ -417,17 +417,15 @@ internal class ProComic(context: MangaLoaderContext) :
                             put("token", entry.optString("token"))
                             put("method", entry.optString("method"))
                             put("cdnPath", cdnPath)
-                            put("pageIndex", images.size + deferredImages.size + i)
+                            pass?.let { put("pass", it) }
                         }
-                        mapRequests.add("http://procomic.pieces#${plan}")
+                        images.add("http://$PIECE_HOST#${plan}")
                     }
                 }
             }
         }
 
-        val deferredUrls = deferredImages.map { "http://procomic.signed?url=${it.urlEncoded()}" }
-
-        return (images + deferredUrls + mapRequests).map { url ->
+        return images.map { url ->
             MangaPage(
                 id = generateUid(url),
                 url = url,
@@ -437,16 +435,139 @@ internal class ProComic(context: MangaLoaderContext) :
         }
     }
 
+    private suspend fun loginTurnstileKey(): String? = runCatching {
+        webClient.httpGet("$baseUrl/api/auth/public-settings", getRequestHeaders())
+            .parseJson()
+            ?.optJSONObject("loginTurnstile")
+            ?.takeIf { it.optBoolean("enabled", false) }
+            ?.optString("siteKey")
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    private fun signedProxyUrl(image: String, pass: String?): String = buildString {
+        append("http://$SIGNED_IMAGE_HOST?url=").append(image.urlEncoded())
+        pass?.takeIf { it.isNotBlank() }?.let {
+            append("&pass=").append(it.urlEncoded())
+        }
+    }
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val url = request.url
-
-        return when (url.host) {
-            PIECE_HOST -> runCatching { stitchResponse(request, url, chain) }
+        return when (request.url.host) {
+            PIECE_HOST -> runCatching { stitch(request, chain) }
                 .getOrElse { errorResponse(request, it) }
-            SIGNED_IMAGE_HOST -> runCatching { signAndRedirect(request, url, chain) }
+            SIGNED_IMAGE_HOST -> runCatching { signAndRedirect(request, chain) }
                 .getOrElse { errorResponse(request, it) }
             else -> chain.proceed(request)
+        }
+    }
+
+    private fun signAndRedirect(request: Request, chain: Interceptor.Chain): Response {
+        val url = request.url
+        val image = url.queryParameter("url") ?: return chain.proceed(request)
+        val pass = url.queryParameter("pass")
+
+        val signed = runCatching { signImage(image, pass) }
+            .getOrNull() ?: return chain.proceed(request)
+
+        val signedUrl = "$baseUrl/api/cdn-image".toHttpUrl().newBuilder()
+            .addQueryParameter("url", image)
+            .addQueryParameter("token", signed.first)
+            .addQueryParameter("expires", signed.second.toString())
+            .build()
+
+        return chain.proceed(request.newBuilder().url(signedUrl).build())
+    }
+
+    private fun signImage(image: String, pass: String?): Pair<String, Long> {
+        val body = JSONObject().put("url", image)
+        val headers = getRequestHeaders().newBuilder().apply {
+            pass?.takeIf { it.isNotBlank() }?.let { set("x-chapter-pass", it) }
+        }.build()
+        val req = Request.Builder()
+            .url("$baseUrl/api/cdn-image/sign")
+            .headers(headers)
+            .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        context.httpClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("Sign failed ${resp.code}")
+            val json = JSONObject(resp.body?.string() ?: "{}")
+            val token = json.optString("token")
+            if (token.isBlank()) throw IOException("No sign token")
+            return token to json.optLong("expires", 0L)
+        }
+    }
+
+    private fun stitch(request: Request, chain: Interceptor.Chain): Response {
+        val plan = JSONObject(request.url.fragment ?: throw IOException("No plan"))
+        val chapterId = plan.optInt("chapterId")
+        if (chapterId <= 0) throw IOException("Bad chapterId")
+        val pass = plan.optString("pass").takeIf { it.isNotBlank() }
+
+        val planBody = JSONObject().apply {
+            put("token", plan.optString("token"))
+            put("method", plan.optString("method"))
+            put("cdnPath", plan.optString("cdnPath"))
+        }
+        val planHeaders = getRequestHeaders().newBuilder().apply {
+            pass?.let { set("x-chapter-pass", it) }
+        }.build()
+        val planReq = Request.Builder()
+            .url("$baseUrl/chapter-map-proxy-plan/$chapterId")
+            .headers(planHeaders)
+            .post(planBody.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+
+        val planJson = context.httpClient.newCall(planReq).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("Plan failed ${resp.code}")
+            JSONObject(resp.body?.string() ?: "{}")
+        }
+        val map = planJson.optJSONObject("data")?.optJSONObject("map")
+            ?: throw IOException("Map missing")
+        val dim = map.getJSONArray("dim")
+        val pieces = map.getJSONArray("pieces")
+        val order = map.getJSONArray("order")
+        val rects = map.getJSONArray("rects")
+
+        val width = dim.getInt(0)
+        val height = dim.getInt(1)
+        if (width <= 0 || height <= 0) throw IOException("Bad dim ${width}x$height")
+
+        val bitmap = context.createBitmap(width, height)
+
+        for (i in 0 until rects.length()) {
+            if (chain.call().isCanceled()) throw IOException("Canceled")
+            val rect = rects.getJSONObject(i)
+            val pieceUrl = pieces.getString(order.getInt(i))
+            val pieceReq = Request.Builder()
+                .url(pieceUrl)
+                .headers(getRequestHeaders())
+                .build()
+            context.httpClient.newCall(pieceReq).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("Piece failed ${resp.code}")
+                context.redrawImageResponse(resp) { pieceBmp ->
+                    bitmap.drawBitmap(
+                        pieceBmp,
+                        Rect(0, 0, pieceBmp.width, pieceBmp.height),
+                        Rect(
+                            rect.getInt("left"),
+                            rect.getInt("top"),
+                            rect.getInt("left") + rect.getInt("width"),
+                            rect.getInt("top") + rect.getInt("height"),
+                        ),
+                    )
+                    pieceBmp
+                }.close()
+            }
+        }
+
+        val basePieceUrl = pieces.getString(order.getInt(0))
+        val baseReq = Request.Builder()
+            .url(basePieceUrl)
+            .headers(getRequestHeaders())
+            .build()
+        return context.httpClient.newCall(baseReq).execute().use { baseResp ->
+            context.redrawImageResponse(baseResp) { _ -> bitmap }
         }
     }
 
@@ -459,115 +580,12 @@ internal class ProComic(context: MangaLoaderContext) :
             .body("".toResponseBody(null))
             .build()
 
-    private fun signAndRedirect(
-        request: Request,
-        url: HttpUrl,
-        chain: Interceptor.Chain,
-    ): Response {
-        val image = url.queryParameter("url") ?: return chain.proceed(request)
-        val signed = runCatching { signImage(image) }.getOrNull() ?: return chain.proceed(request)
-        val signedUrl = "$baseUrl/api/cdn-image".toHttpUrl().newBuilder()
-            .addQueryParameter("url", image)
-            .addQueryParameter("token", signed.first)
-            .addQueryParameter("expires", signed.second.toString())
-            .build()
-        return chain.proceed(request.newBuilder().url(signedUrl).build())
-    }
-
-    private fun signImage(image: String): Pair<String, Long> {
-        val url = "$baseUrl/api/cdn-image/sign"
-        val body = JSONObject().put("url", image)
-        val req = Request.Builder()
-            .url(url)
-            .headers(getRequestHeaders())
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        context.httpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IOException("Sign failed ${resp.code}")
-            val json = JSONObject(resp.body?.string() ?: "")
-            return json.optString("token") to json.optLong("expires", 0L)
-        }
-    }
-
-    private fun stitchResponse(
-        request: Request,
-        url: HttpUrl,
-        chain: Interceptor.Chain,
-    ): Response {
-        val planData = url.fragment ?: return chain.proceed(request)
-        return stitch(planData, chain.call())
-    }
-    private fun stitch(planJson: String, call: Call): Response {
-        val plan = JSONObject(planJson)
-        val chapterId = plan.optInt("chapterId", -1)
-        if (chapterId <= 0) throw IOException("Map plan missing chapterId")
-
-        val body = JSONObject().apply {
-            put("token", plan.optString("token"))
-            put("method", plan.optString("method"))
-            put("cdnPath", plan.optString("cdnPath"))
-            put("pageIndex", plan.optInt("pageIndex"))
-        }
-        val url = "$baseUrl/chapter-map-proxy-plan/$chapterId"
-        val req = Request.Builder()
-            .url(url)
-            .headers(getRequestHeaders())
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        val planResp = context.httpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IOException("Map plan failed ${resp.code}")
-            JSONObject(resp.body?.string() ?: "")
-        }
-        val map = planResp.optJSONObject("data")?.optJSONObject("map")
-            ?: throw IOException("Map plan missing")
-        val dim = map.optJSONArray("dim") ?: throw IOException("Map dim missing")
-        val w = dim.optInt(0)
-        val h = dim.optInt(1)
-        if (w <= 0 || h <= 0) throw IOException("Bad map dim: ${w}x$h")
-        val pieces = map.optJSONArray("pieces") ?: JSONArray()
-        val order = map.optJSONArray("order") ?: JSONArray()
-        val rects = map.optJSONArray("rects") ?: JSONArray()
-
-        val finalBitmap = context.createBitmap(w, h)
-
-        for (i in 0 until rects.length()) {
-            if (call.isCanceled()) throw IOException("Canceled")
-            val rect = rects.optJSONObject(i) ?: continue
-            val pieceIdx = order.optInt(i, -1)
-            if (pieceIdx < 0) continue
-            val pieceUrl = pieces.optString(pieceIdx)
-            if (pieceUrl.isBlank()) continue
-
-            val pieceReq = Request.Builder().url(pieceUrl).headers(getRequestHeaders()).build()
-            context.httpClient.newCall(pieceReq).execute().use { pieceResponse ->
-                if (!pieceResponse.isSuccessful) throw IOException("Piece failed ${pieceResponse.code}")
-
-                context.redrawImageResponse(pieceResponse) { pieceBmp ->
-                    val srcRect = Rect(0, 0, pieceBmp.width, pieceBmp.height)
-                    val dstRect = Rect(
-                        left = rect.optInt("left"),
-                        top = rect.optInt("top"),
-                        right = rect.optInt("left") + rect.optInt("width"),
-                        bottom = rect.optInt("top") + rect.optInt("height"),
-                    )
-                    finalBitmap.drawBitmap(pieceBmp, srcRect, dstRect)
-                    pieceBmp
-                }.close()
-            }
-        }
-
-        val firstPieceUrl = pieces.optString(order.optInt(0, 0))
-        if (firstPieceUrl.isBlank()) throw IOException("No base piece")
-        val baseReq = Request.Builder().url(firstPieceUrl).headers(getRequestHeaders()).build()
-        return context.httpClient.newCall(baseReq).execute().use { baseResponse ->
-            context.redrawImageResponse(baseResponse) { _ -> finalBitmap }
-        }
-    }
-
     override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
 
     companion object {
         private const val PIECE_HOST = "procomic.pieces"
         private const val SIGNED_IMAGE_HOST = "procomic.signed"
+        private const val TURNSTILE_SITE_KEY = "0x4AAAAAACk1d7qWJi_of2qU"
+        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }
 }

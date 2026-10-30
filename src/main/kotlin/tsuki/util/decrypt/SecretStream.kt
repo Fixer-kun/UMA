@@ -11,7 +11,7 @@ package tsuki.util.decrypt
  */
 internal object SecretStream {
 
-    // ============================== ChaCha20 ==============================
+    // ChaCha20
 
     private const val ROUNDS = 20
     private const val POLY_HIGH_BIT = 1L shl 24

@@ -36,7 +36,7 @@ object AesGcmSiv {
      *
      * @param key         16-byte (AES-128) or 32-byte (AES-256) key.
      * @param nonce       12-byte nonce.
-     * @param ciphertext  ciphertext **followed by** the 16-byte tag
+     * @param ciphertext  ciphertext followed by the 16-byte tag
      *                    (`ct || tag`), matching the RFC 8452 wire format.
      * @param aad         associated data, may be empty.
      */

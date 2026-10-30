@@ -22,7 +22,7 @@ import tsuki.model.SortOrder
 
 import tsuki.util.generateUid
 import tsuki.util.parseHtml
-import tsuki.util.urlEncoded
+import tsuki.util.NextJsData
 
 import okhttp3.Headers
 import org.json.JSONObject
@@ -36,7 +36,7 @@ import java.util.TimeZone
 
 @MangaSourceParser("TEMPLESCAN", "Temple Scan", "en", ContentType.HENTAI)
 internal class TempleScan(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.TEMPLESCAN, pageSize = 20) {
+    PagedMangaParser(context, MangaParserSource.TEMPLESCAN, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("templetoons.com")
 
@@ -47,9 +47,9 @@ internal class TempleScan(context: MangaLoaderContext) :
             .set(CommonHeaders.USER_AGENT, config[userAgentKey])
             .set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
             .set(CommonHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .set(CommonHeaders.SEC_FETCH_DEST, "document")
-            .set(CommonHeaders.SEC_FETCH_MODE, "navigate")
-            .set(CommonHeaders.SEC_FETCH_SITE, "none")
+            .set(CommonHeaders.SEC_FETCH_DEST, "same-site")
+            .set(CommonHeaders.SEC_FETCH_MODE, "no-cors")
+            .set(CommonHeaders.SEC_FETCH_SITE, "image")
             .set(CommonHeaders.UPGRADE_INSECURE_REQUESTS, "1")
             .build()
 
@@ -83,39 +83,90 @@ internal class TempleScan(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val queryParts = mutableListOf<String>()
-        if (page > 1) queryParts.add("page=$page")
+        val doc = webClient.httpGet("https://$domain/comics").parseHtml()
 
-        filter.states.firstOrNull()?.let { state ->
-            val statusValue = when (state) {
+        val list = NextJsData.findLargestArray(doc.outerHtml()) { obj ->
+            obj.has("iw7kl7l") && obj.has("ke8ivdg")
+        } ?: return parseCards(doc)
+
+        data class Entry(
+            val manga: Manga,
+            val status: String,
+            val title: String,
+            val altNames: String?,
+            val views: Long,
+            val updatedAt: Long,
+            val createdAt: Long,
+        )
+
+        val entries = buildList {
+            for (i in 0 until list.length()) {
+                val obj = list.optJSONObject(i) ?: continue
+                val slug = obj.optString("ke8ivdg").takeIf { it.isNotBlank() } ?: continue
+                val title = obj.optString("iw7kl7l").takeIf { it.isNotBlank() } ?: continue
+                val cover = obj.optString("thumbnail").takeIf { it.isNotBlank() }
+                val badge = obj.optString("badge").takeIf { it.isNotBlank() }
+
+                add(
+                    Entry(
+                        manga = Manga(
+                            id = generateUid(slug),
+                            url = "/comic/$slug",
+                            publicUrl = "https://$domain/comic/$slug",
+                            title = title,
+                            altTitles = emptySet(),
+                            coverUrl = cover,
+                            authors = emptySet(),
+                            state = null,
+                            contentRating = null,
+                            tags = badge?.let { setOf(MangaTag(it.lowercase(), it, source)) } ?: emptySet(),
+                            rating = RATING_UNKNOWN,
+                            source = source,
+                        ),
+                        status = obj.optString("status"),
+                        title = title,
+                        altNames = obj.optString("alternative_names").takeIf { it.isNotBlank() },
+                        views = obj.optLong("total_views"),
+                        updatedAt = parseDate(obj.optString("update_chapter")),
+                        createdAt = parseDate(obj.optString("created_at")),
+                    ),
+                )
+            }
+        }
+        if (entries.isEmpty()) return parseCards(doc)
+
+        val byState = filter.states.firstOrNull()?.let { state ->
+            val value = when (state) {
                 MangaState.ONGOING -> "Ongoing"
                 MangaState.FINISHED -> "Completed"
                 MangaState.PAUSED -> "Hiatus"
                 MangaState.ABANDONED -> "Canceled"
                 else -> null
             }
-            if (statusValue != null) queryParts.add("status=$statusValue")
-        }
+            if (value != null) entries.filter { it.status.equals(value, ignoreCase = true) } else entries
+        } ?: entries
 
-        filter.query?.trim()?.takeIf { it.isNotBlank() }?.let { q ->
-            queryParts.add("q=${q.urlEncoded()}")
-        }
-
-        val url = buildString {
-            append("https://$domain/comics")
-            if (queryParts.isNotEmpty()) {
-                append("?")
-                append(queryParts.joinToString("&"))
+        val query = filter.query?.trim()
+        val bySearch = if (!query.isNullOrBlank()) {
+            byState.filter {
+                it.title.contains(query, ignoreCase = true) ||
+                        it.altNames?.contains(query, ignoreCase = true) == true
             }
+        } else byState
+
+        val sorted = when (order) {
+            SortOrder.UPDATED -> bySearch.sortedByDescending { it.updatedAt }
+            SortOrder.NEWEST -> bySearch.sortedByDescending { it.createdAt }
+            SortOrder.POPULARITY -> bySearch.sortedByDescending { it.views }
+            SortOrder.ALPHABETICAL -> bySearch.sortedBy { it.title.lowercase() }
+            else -> bySearch.sortedByDescending { it.updatedAt }
         }
 
-        val doc = webClient.httpGet(url).parseHtml()
-        val cards = parseCards(doc)
-
-        return when (order) {
-            SortOrder.ALPHABETICAL -> cards.sortedBy { it.title.lowercase() }
-            else -> cards
-        }
+        val pageSize = 15
+        val from = (page - 1) * pageSize
+        if (from >= sorted.size) return emptyList()
+        val to = minOf(from + pageSize, sorted.size)
+        return sorted.subList(from, to).map { it.manga }
     }
 
     private fun parseCards(doc: Document): List<Manga> {
@@ -214,7 +265,7 @@ internal class TempleScan(context: MangaLoaderContext) :
             else -> null
         }
 
-        val chapters = parseChaptersFromHtml(doc)
+        val chapters = parseChapters(doc, slug)
 
         return manga.copy(
             title = seriesLd?.optString("name")?.takeIf { it.isNotBlank() } ?: slug,
@@ -234,6 +285,56 @@ internal class TempleScan(context: MangaLoaderContext) :
         )
     }
 
+    private fun parseChapters(doc: Document, slug: String): List<MangaChapter> {
+        parseChaptersFromNextData(doc, slug).takeIf { it.isNotEmpty() }?.let { return it }
+        return parseChaptersFromHtml(doc)
+    }
+
+    private fun parseChaptersFromNextData(doc: Document, slug: String): List<MangaChapter> {
+        val seriesData = NextJsData.findObject(doc.outerHtml(), "ke8ivdg", slug, *arrayOf("fpqwjqw"))
+            ?: return emptyList()
+
+        val seasons = seriesData.optJSONArray("fpqwjqw") ?: return emptyList()
+        val out = mutableListOf<MangaChapter>()
+
+        for (s in 0 until seasons.length()) {
+            val season = seasons.optJSONObject(s) ?: continue
+            val chapters = season.optJSONArray("zjb9eix") ?: continue
+            for (i in 0 until chapters.length()) {
+                val ch = chapters.optJSONObject(i) ?: continue
+                val urlSlug = ch.optString("yy1u07t").takeIf { it.isNotBlank() } ?: continue
+                val displayName = ch.optString("q8m6vtm").trim().takeIf { it.isNotBlank() } ?: continue
+                val subtitle = ch.optString("chapter_title")
+                    .takeIf { it.isNotBlank() }
+                    ?.takeUnless { it.equals("null", true) || it.equals("undefined", true) }
+                val number = ch.optString("index").toFloatOrNull() ?: continue
+                val uploadDate = parseDate(ch.optString("created_at"))
+
+                val title = buildString {
+                    append(displayName)
+                    if (subtitle != null) append(": ").append(subtitle)
+                }
+                    .replace(Regex("""\s+(?i:null|undefined)\s*$"""), "")
+                    .trim()
+
+                val href = "/comic/$slug/$urlSlug"
+
+                out += MangaChapter(
+                    id = generateUid(href),
+                    title = title,
+                    number = number,
+                    volume = 0,
+                    url = href,
+                    uploadDate = uploadDate,
+                    source = source,
+                    scanlator = null,
+                    branch = null,
+                )
+            }
+        }
+        return out.distinctBy { it.url }.sortedBy { it.number }
+    }
+
     private fun parseChaptersFromHtml(doc: Document): List<MangaChapter> {
         val links = doc.select("ul#chapter-list li a[href*=chapter-]")
             .filterNot { a ->
@@ -249,9 +350,11 @@ internal class TempleScan(context: MangaLoaderContext) :
             val numStr = numMatch.groupValues[1]
             val number = numStr.toFloatOrNull() ?: return@mapNotNull null
 
-            val title = a.selectFirst("span.font-semibold")?.text()?.trim()
+            val title = (a.selectFirst("span.font-semibold")?.text()?.trim()
                 ?.takeIf { it.isNotBlank() }
-                ?: "Chapter $numStr"
+                ?: "Chapter $numStr")
+                .replace(Regex("""\s+(?i:null|undefined)\s*$"""), "")
+                .trim()
 
             val uploadDate = a.selectFirst("time[datetime]")
                 ?.attr("datetime")
@@ -277,45 +380,22 @@ internal class TempleScan(context: MangaLoaderContext) :
         val url = "https://$domain${chapter.url}"
         val doc = webClient.httpGet(url).parseHtml()
 
-        val htmlImgs = doc.select("main img, article img, figure img, .reader img, [class*=reader] img")
-            .mapNotNull { img ->
-                val src = (img.absUrl("src").takeIf { it.isNotBlank() }
-                    ?: img.absUrl("data-src").takeIf { it.isNotBlank() }
-                    ?: img.absUrl("data-lazy-src").takeIf { it.isNotBlank() })
-                    ?.takeIf { isValidReaderImage(it) }
-                    ?: return@mapNotNull null
-                src
-            }
-            .distinct()
-
-        if (htmlImgs.isNotEmpty()) {
-            return htmlImgs.map { MangaPage(id = generateUid(it), url = it, preview = null, source = source) }
+        return extractPagesFromNextData(doc).map { imageUrl ->
+            MangaPage(id = generateUid(imageUrl), url = imageUrl, preview = null, source = source)
         }
-
-        val html = doc.html().replace("\\/", "/")
-        val fromRegex = IMAGE_URL_REGEX.findAll(html)
-            .map { it.value.replace("\\/", "/") }
-            .filter { isValidReaderImage(it) }
-            .distinct()
-            .toList()
-
-        return fromRegex.map { MangaPage(id = generateUid(it), url = it, preview = null, source = source) }
     }
 
-    private fun isValidReaderImage(url: String): Boolean {
-        val lower = url.lowercase()
-        val hasImageExt = lower.contains(".webp") || lower.contains(".jpg") ||
-                lower.contains(".jpeg") || lower.contains(".png") || lower.contains(".avif")
-        if (!hasImageExt) return false
+    private fun extractPagesFromNextData(doc: Document): List<String> {
+        val props = NextJsData.findValue(doc.outerHtml()) { node ->
+            node is JSONObject && node.has("k9wavlj")
+        } as? JSONObject ?: return emptyList()
 
-        val looksLikeContent = lower.contains("media.") || lower.contains("cdn.") ||
-                lower.contains("/file/") || lower.contains("/chapter")
-        if (!looksLikeContent) return false
-
-        val isChrome = lower.contains("/cover") || lower.contains("logo") ||
-                lower.contains("banner") || lower.contains("favicon") || lower.contains("avatar") ||
-                lower.contains("thumbnail")
-        return !isChrome
+        val arr = props.optJSONArray("k9wavlj") ?: return emptyList()
+        val out = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            arr.optString(i).takeIf { it.isNotBlank() }?.let(out::add)
+        }
+        return out
     }
 
     private fun parseDate(text: String?): Long {
@@ -375,13 +455,6 @@ internal class TempleScan(context: MangaLoaderContext) :
         }?.takeIf { it.isNotBlank() }
 
     companion object {
-        private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-
-        private val IMAGE_URL_REGEX = Regex(
-            """https?://[^"\s]+?\.(?:jpe?g|png|webp|avif|gif)""",
-            RegexOption.IGNORE_CASE,
-        )
-
         private val ABSOLUTE_DATE_PATTERNS = listOf(
             "MMM d, yyyy",
             "MMMM d, yyyy",

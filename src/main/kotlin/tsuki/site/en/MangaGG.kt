@@ -19,6 +19,7 @@ import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Document
 import java.text.SimpleDateFormat
 import kotlinx.coroutines.awaitAll
+import org.jsoup.nodes.Element
 
 @MangaSourceParser("MANGAGG", "MangaGG", "en")
 internal class MangaGG(context: MangaLoaderContext) :
@@ -27,120 +28,56 @@ internal class MangaGG(context: MangaLoaderContext) :
     override val tagPrefix = "genre/"
     override val datePattern = "MM/dd/yyyy"
 
-    override suspend fun loadChapters(
-        mangaUrl: String,
-        document: Document,
-    ): List<MangaChapter> = coroutineScope {
-
+    override suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> = coroutineScope {
         val baseUrl = mangaUrl
             .toAbsoluteUrl(domain)
             .removeSuffix('/')
-
         val chapters = mutableListOf<MangaChapter>()
-
         var page = 1
         var finished = false
-
         while (!finished) {
-
             val jobs = (page until page + 5).map { currentPage ->
                 async {
-                    fetchChapterPage(
-                        baseUrl,
-                        currentPage,
-                    )
+                    fetchChapterPage(baseUrl, currentPage,)
                 }
             }
-
             val results = jobs.awaitAll()
-
-            finished = results.all {
-                it.isEmpty()
-            }
-
-            results.forEach {
-                chapters.addAll(it)
-            }
-
+            finished = results.all { it.isEmpty() }
+            results.forEach { chapters.addAll(it) }
             page += 5
         }
-
         chapters
-            .distinctBy {
-                it.id
-            }
+            .distinctBy { it.id }
             .reversed()
-            .mapIndexed { index, chapter ->
-                chapter.copy(
-                    number = index + 1f
-                )
-            }
+            .mapIndexed { index, chapter -> chapter.copy(number = index + 1f)}
     }
-
-
-    private suspend fun fetchChapterPage(
-        mangaUrl: String,
-        page: Int,
-    ): List<MangaChapter> {
-
-        val url =
-            "$mangaUrl/ajax/chapters/?t=$page"
-
+    
+    private suspend fun fetchChapterPage(mangaUrl: String, page: Int): List<MangaChapter> {
+        val url = "$mangaUrl/ajax/chapters/?t=$page"
         return runCatching {
-
-            webClient
-                .httpPost(
-                    url,
-                    emptyMap(),
-                )
+            webClient.httpPost(url, emptyMap())
                 .parseHtml()
                 .let(::parseChapterPage)
-
         }.getOrDefault(emptyList())
     }
 
-
-    private fun parseChapterPage(
-        doc: Document,
-    ): List<MangaChapter> {
-
-        val dateFormat =
-            SimpleDateFormat(
-                datePattern,
-                sourceLocale,
-            )
-
+    private fun parseChapterPage(doc: Document): List<MangaChapter> { 
+        val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
         return doc
             .select(selectChapter)
-            .map { li ->
-                parseChapterItem(
-                    li,
-                    dateFormat,
-                )
-            }
+            .map { li -> parseChapterItem(li, dateFormat) }
     }
 
-
-    private fun parseChapterItem(
-        li: org.jsoup.nodes.Element,
-        dateFormat: SimpleDateFormat,
-    ): MangaChapter {
-
+    private fun parseChapterItem(li: Element, dateFormat: SimpleDateFormat): MangaChapter {
         val a = li.selectFirstOrThrow("a")
-
         val href = a.attrAsRelativeUrl("href")
-
-        val dateText =
-            li.selectFirst("a.c-new-tag")
+        val dateText = li.selectFirst("a.c-new-tag")
                 ?.attr("title")
                 ?: li.selectFirst(selectDate)
                     ?.text()
-
-        val name =
-            a.selectFirst("p")
+        val name = a.selectFirst("p")
                 ?.text()
                 ?: a.ownText()
-
         return MangaChapter(
             id = generateUid(href),
             title = name,

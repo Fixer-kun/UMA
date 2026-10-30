@@ -152,7 +152,7 @@ internal class DespairManga(context: MangaLoaderContext) :
                 .addQueryParameter("select", CHAPTER_COLUMNS)
                 .addQueryParameter("work_id", "eq.$workId")
                 .addQueryParameter("order", "chapter_number.desc,id.desc")
-                .addQueryParameter("limit", CHAPTER_CHUNK.toString())
+                 //.addQueryParameter("limit", CHAPTER_CHUNK.toString())
                 .addQueryParameter("offset", offset.toString())
                 .build()
             val array = fetchArray(url)

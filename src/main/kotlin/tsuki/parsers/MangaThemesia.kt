@@ -299,7 +299,7 @@ abstract class MangaThemesia(
 
     protected fun splitAltTitles(text: String?): Set<String> {
         return text.orEmpty()
-            .split(',', ';', '/', '•', '\n')
+            .split(',', ';', '/', '|', '•', '\n', '\r')
             .map { it.trim() }
             .filter { it.isNotBlank() && !it.equals("n/a", true) }
             .toSet()

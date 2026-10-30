@@ -36,7 +36,7 @@ import java.util.TimeZone
 
 @MangaSourceParser("TEMPLESCAN", "Temple Scan", "en", ContentType.HENTAI)
 internal class TempleScan(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.TEMPLESCAN, pageSize = 20) {
+    PagedMangaParser(context, MangaParserSource.TEMPLESCAN, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("templetoons.com")
 
@@ -47,9 +47,9 @@ internal class TempleScan(context: MangaLoaderContext) :
             .set(CommonHeaders.USER_AGENT, config[userAgentKey])
             .set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
             .set(CommonHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .set(CommonHeaders.SEC_FETCH_DEST, "document")
-            .set(CommonHeaders.SEC_FETCH_MODE, "navigate")
-            .set(CommonHeaders.SEC_FETCH_SITE, "none")
+            .set(CommonHeaders.SEC_FETCH_DEST, "same-site")
+            .set(CommonHeaders.SEC_FETCH_MODE, "no-cors")
+            .set(CommonHeaders.SEC_FETCH_SITE, "image")
             .set(CommonHeaders.UPGRADE_INSECURE_REQUESTS, "1")
             .build()
 

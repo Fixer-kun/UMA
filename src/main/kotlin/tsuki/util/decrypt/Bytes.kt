@@ -2,7 +2,9 @@ package tsuki.util.decrypt
 
 import java.security.MessageDigest
 import java.util.Base64
+import javax.crypto.Cipher
 import javax.crypto.Mac
+import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
@@ -50,4 +52,45 @@ internal object Bytes {
     fun sha256(d: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(d)
     fun sha384(d: ByteArray): ByteArray = MessageDigest.getInstance("SHA-384").digest(d)
     fun sha512(d: ByteArray): ByteArray = MessageDigest.getInstance("SHA-512").digest(d)
+
+    /**
+     * Plain AES-GCM (NIST SP 800-38D) decrypt-and-verify.
+     *
+     * Unlike [AesGcmSiv] and [AesSiv] this is not nonce-misuse-resistant:
+     * the caller must not reuse `(key, iv)` across different plaintexts.
+     * It is included because some sites
+     * emit standard `AES/GCM/NoPadding` and there is no compatible primitive
+     * in this package.
+     *
+     * @param key           16/24/32-byte AES key.
+     * @param iv            typically 12 bytes, though JCE accepts other
+     *                      lengths for GCM.
+     * @param ciphertextWithTag  ciphertext followed by the tag
+     *                      (`ct || tag`), matching the JCE wire format.
+     * @param tagLengthBits tag length in **bits** (default 128).
+     */
+    fun aesGcmDecrypt(
+        key: ByteArray,
+        iv: ByteArray,
+        ciphertextWithTag: ByteArray,
+        tagLengthBits: Int = 128,
+    ): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            GCMParameterSpec(tagLengthBits, iv),
+        )
+        return cipher.doFinal(ciphertextWithTag)
+    }
+
+    /** Hex-string decoding (`"deadbeef"` to `byteArrayOf(...)`). */
+    fun String.decodeHex(): ByteArray {
+        require(length % 2 == 0) { "hex string length must be even" }
+        return ByteArray(length / 2) { i -> substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+    }
+
+    /** Reads a big-endian 16-bit unsigned integer at [offset]. */
+    fun ByteArray.readUShortBigEndian(offset: Int): Int =
+        ((this[offset].toInt() and 0xFF) shl 8) or (this[offset + 1].toInt() and 0xFF)
 }

@@ -24,6 +24,7 @@ import tsuki.util.urlEncoded
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -35,6 +36,183 @@ import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.runBlocking
+import kotlin.time.Duration.Companion.milliseconds
+
+private class ChallengeInterceptor(
+    private val parser: MangaTube,
+) : Interceptor {
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+        if (originalRequest.header(CHALLENGE_BYPASSED_HEADER) == "1") {
+            return chain.proceed(originalRequest)
+        }
+
+        if (originalRequest.url.encodedPath.startsWith("/api/") && needsBootstrap(originalRequest.url)) {
+            bootstrapSession()
+        }
+
+        val response = chain.proceed(originalRequest)
+        val bodyString = response.peekBody(Long.MAX_VALUE).string()
+        if (!isChallengePage(bodyString)) {
+            return response
+        }
+
+        response.close()
+
+        val httpSolved = runCatching { solveChallenge(bodyString) }
+            .getOrDefault(false) && hasRequiredCookies()
+
+        if (!httpSolved) {
+            if (!solveChallengeViaWebView(parser.baseUrl)) {
+                throw IOException(
+                    "Challenge solve failed via HTTP and WebView. " +
+                            "The site may be serving a hard block — open " +
+                            "${parser.baseUrl} in your browser once to verify.",
+                )
+            }
+        }
+
+        return chain.proceed(
+            originalRequest.newBuilder()
+                .header(CHALLENGE_BYPASSED_HEADER, "1")
+                .build(),
+        )
+    }
+
+    private fun isChallengePage(body: String): Boolean =
+        body.contains("window.__challange") || body.contains("_challange =")
+
+    private fun needsBootstrap(url: HttpUrl): Boolean {
+        val cookies = parser.context.cookieJar.loadForRequest(url)
+        return REQUIRED_API_COOKIES.any { required -> cookies.none { it.name == required } }
+    }
+
+    private fun hasRequiredCookies(
+        url: HttpUrl = parser.baseUrl.toHttpUrl(),
+    ): Boolean {
+        val cookieNames = parser.context.cookieJar.loadForRequest(url).map { it.name }.toSet()
+        return REQUIRED_API_COOKIES.all { it in cookieNames }
+    }
+
+    private fun solveChallenge(body: String): Boolean {
+        val match = CHALLENGE_REGEX.find(body)
+            ?: return false
+
+        val json = JSONObject(match.groupValues[1])
+        val tk = json.getString("tk")
+        val arg1 = json.getString("arg1")
+        val arg2 = json.getString("arg2")
+        val arg3 = json.getString("arg3")
+        val solution = solve(arg1, arg2, arg3)
+
+        val challengeHeaders = sourceHeaders().newBuilder()
+            .add("Content-Type", "application/x-www-form-urlencoded")
+            .add("x-challange-token", tk)
+            .add("x-challange-arg1", arg1)
+            .add("x-challange-arg2", arg2)
+            .add("x-challange-arg3", arg3)
+            .add("x-challange-arg4", solution)
+            .build()
+
+        Thread.sleep(CHALLENGE_DELAY_MS)
+
+        val postRequest = Request.Builder()
+            .url(parser.baseUrl + "/")
+            .post(FormBody.Builder().build())
+            .headers(challengeHeaders)
+            .build()
+
+        return runCatching {
+            parser.baseClient.newCall(postRequest).execute().use { resp ->
+                resp.isSuccessful
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun solve(arg1: String, arg2: String, op: String): String {
+        val left = arg1.toLong(16).toDouble()
+        val right = arg2.toLong(16).toDouble()
+        val result = when (op) {
+            "a" -> left / right
+            "b" -> left * right
+            "c" -> left - right
+            "d" -> left + right
+            else -> throw IOException("Unknown challenge op: $op")
+        }
+        return if (result == result.toLong().toDouble()) result.toLong().toString()
+        else result.toString()
+    }
+
+    private fun solveChallengeViaWebView(url: String): Boolean = runBlocking {
+        val script = """
+            (() => new Promise(resolve => {
+                const started = Date.now();
+                const check = () => {
+                    const html = document.documentElement
+                        ? document.documentElement.innerHTML
+                        : '';
+                    const isChallenge =
+                        html.includes('_challange =') ||
+                        html.includes('window.__challange');
+                    if (!isChallenge && document.readyState === 'complete') {
+                        resolve('ok');
+                    } else if (Date.now() - started > 25000) {
+                        resolve('timeout');
+                    } else {
+                        setTimeout(check, 300);
+                    }
+                };
+                check();
+            }))();
+        """.trimIndent()
+
+        runCatching {
+            withTimeoutOrNull(CHALLENGE_WEBVIEW_TIMEOUT_MS.milliseconds) {
+                parser.context.evaluateJs(url, script)
+            }
+        }
+
+        hasRequiredCookies(url.toHttpUrl())
+    }
+
+    private fun bootstrapSession() {
+        val request = Request.Builder()
+            .url(parser.baseUrl)
+            .headers(sourceHeaders())
+            .build()
+
+        val response = parser.baseClient.newCall(request).execute()
+        val bodyString = response.peekBody(Long.MAX_VALUE).string()
+        response.close()
+
+        if (!isChallengePage(bodyString)) return
+
+        if (solveChallenge(bodyString) && hasRequiredCookies()) {
+            parser.baseClient.newCall(request).execute().close()
+            return
+        }
+
+        if (solveChallengeViaWebView(parser.baseUrl)) return
+
+        throw IOException("Bootstrap challenge solve failed via HTTP and WebView")
+    }
+
+    private fun sourceHeaders(): Headers = Headers.Builder()
+        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .add("User-Agent", parser.getUserAgent())
+        .build()
+
+    companion object {
+        private val CHALLENGE_REGEX = Regex("""_challange = (.+?);""")
+        private val REQUIRED_API_COOKIES = setOf("XSRF-TOKEN", "manga_tube_beta_session", "__mtbpass")
+        private const val CHALLENGE_BYPASSED_HEADER = "X-MangaTube-Challenge-Bypassed"
+        private const val CHALLENGE_DELAY_MS = 1_000L
+        private const val CHALLENGE_WEBVIEW_TIMEOUT_MS = 30_000L
+    }
+}
 
 @MangaSourceParser("MANGATUBE", "Manga Tube", "de")
 internal class MangaTube(context: MangaLoaderContext) :
@@ -217,118 +395,5 @@ internal class MangaTube(context: MangaLoaderContext) :
 
     companion object {
         private const val LATEST_PAGE_SIZE = 40
-    }
-}
-
-private class ChallengeInterceptor(
-    private val parser: MangaTube,
-) : Interceptor {
-
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val originalRequest = chain.request()
-        if (originalRequest.header(CHALLENGE_BYPASSED_HEADER) == "1") {
-            return chain.proceed(originalRequest)
-        }
-
-        if (originalRequest.url.encodedPath.startsWith("/api/") && needsBootstrap(originalRequest.url)) {
-            bootstrapSession()
-        }
-
-        val response = chain.proceed(originalRequest)
-        val bodyString = response.peekBody(Long.MAX_VALUE).string()
-        if (!isChallengePage(bodyString)) {
-            return response
-        }
-
-        response.close()
-        solveChallenge(bodyString)
-
-        return chain.proceed(
-            originalRequest.newBuilder()
-                .header(CHALLENGE_BYPASSED_HEADER, "1")
-                .build()
-        )
-    }
-
-    private fun isChallengePage(body: String): Boolean =
-        body.contains("window.__challange") || body.contains("_challange =")
-
-    private fun needsBootstrap(url: HttpUrl): Boolean {
-        val cookies = parser.context.cookieJar.loadForRequest(url)
-        return REQUIRED_API_COOKIES.any { required -> cookies.none { it.name == required } }
-    }
-
-    private fun bootstrapSession() {
-        val request = Request.Builder()
-            .url(parser.baseUrl)
-            .headers(sourceHeaders())
-            .build()
-        val response = parser.baseClient.newCall(request).execute()
-        val bodyString = response.peekBody(Long.MAX_VALUE).string()
-        if (isChallengePage(bodyString)) {
-            response.close()
-            solveChallenge(bodyString)
-            parser.baseClient.newCall(request).execute().close()
-            return
-        }
-        response.close()
-    }
-
-    private fun solveChallenge(body: String) {
-        val regex = Regex("""_challange = (.+?);""")
-        val match = regex.find(body)
-            ?: throw IOException("Challenge payload not found")
-
-        val json = JSONObject(match.groupValues[1])
-        val tk = json.getString("tk")
-        val arg1 = json.getString("arg1")
-        val arg2 = json.getString("arg2")
-        val arg3 = json.getString("arg3")
-        val solution = solve(arg1, arg2, arg3)
-
-        val challengeHeaders = sourceHeaders().newBuilder()
-            .add("Content-Type", "application/x-www-form-urlencoded")
-            .add("x-challange-token", tk)
-            .add("x-challange-arg1", arg1)
-            .add("x-challange-arg2", arg2)
-            .add("x-challange-arg3", arg3)
-            .add("x-challange-arg4", solution)
-            .build()
-
-        Thread.sleep(1000)
-
-        val postBody = FormBody.Builder().build()
-        val postRequest = Request.Builder()
-            .url("${parser.baseUrl}/")
-            .post(postBody)
-            .headers(challengeHeaders)
-            .build()
-
-        parser.baseClient.newCall(postRequest).execute().use { resp ->
-            if (!resp.isSuccessful) throw IOException("Challenge validation failed: ${resp.code}")
-        }
-    }
-
-    private fun solve(arg1: String, arg2: String, op: String): String {
-        val left = arg1.toLong(16).toDouble()
-        val right = arg2.toLong(16).toDouble()
-        val result = when (op) {
-            "a" -> left / right
-            "b" -> left * right
-            "c" -> left - right
-            "d" -> left + right
-            else -> throw IOException("Unknown challenge op: $op")
-        }
-        return if (result == result.toLong().toDouble()) result.toLong().toString() else result.toString()
-    }
-
-    private fun sourceHeaders(): Headers = Headers.Builder()
-        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .add("User-Agent", parser.getUserAgent())
-        .build()
-
-    companion object {
-        private val REQUIRED_API_COOKIES = setOf("XSRF-TOKEN", "manga_tube_beta_session", "__mtbpass")
-        private const val CHALLENGE_BYPASSED_HEADER = "X-MangaTube-Challenge-Bypassed"
     }
 }
